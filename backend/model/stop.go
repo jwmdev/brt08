@@ -51,6 +51,8 @@ func (s *BusStop) BoardAtStop(bus *Bus, now time.Time) []*Passenger {
     }
     remaining := bus.RemainingCapacity()
     if remaining <= 0 {
+        // Bus already full: do NOT mutate queue
+        if bus.Type != nil && bus.PassengersOnboard >= bus.Type.Capacity { bus.IsFull = true }
         return nil
     }
     boarded := make([]*Passenger, 0, remaining)

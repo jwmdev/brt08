@@ -42,8 +42,28 @@ function buildSegments(stops: Stop[]): Segment[] {
 }
 
 async function init() {
-  const data = await loadRoute();
-  const stops = data.stops;
+  // try backend API first, fallback to static
+  let data: any; // we'll normalize to RouteData shape
+  try {
+    const r = await fetch('/api/route');
+    if (!r.ok) throw new Error('backend route fetch failed');
+    data = await r.json();
+  } catch {
+    data = await loadRoute();
+  }
+
+  // Normalize stop field names (backend uses id/name, frontend expects stop_id/stop_name)
+  const stops: Stop[] = (data.stops || []).map((s: any) => ({
+    stop_id: s.stop_id ?? s.id,
+    stop_name: s.stop_name ?? s.name,
+    latitute: s.latitute,
+    longtude: s.longtude,
+    distance_next_stop: s.distance_next_stop ?? s.distance_to_next ?? s.DistanceToNext ?? 0
+  }));
+
+  // Provide route level fallbacks
+  data.route = data.route || data.name || 'Route';
+  data.direction = data.direction || 'outbound';
 
   const map = L.map('map');
   const osm = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
@@ -61,63 +81,145 @@ async function init() {
   const polylineLatLngs = stops.map(s => [s.latitute, s.longtude]) as [number, number][];
   const routeLine = L.polyline(polylineLatLngs, { color: '#1976d2', weight: 4, opacity: 0.8 }).addTo(map);
 
-  // Build animation segments
-  const segments = buildSegments(stops);
-  const totalKm = segments.reduce((s, seg) => s + seg.lengthKm, 0);
-
-  // Bus marker
+  // Bus marker for live updates
   const bus = L.marker([stops[0].latitute, stops[0].longtude], { icon: createBusIcon() }).addTo(map);
-
-  // Animation settings
-  const speedKmph = 25; // simulation speed
-  const realTimeFactor = 50; // higher = faster animation
-  const metersPerMs = (speedKmph * 1000) / (3600 * realTimeFactor);
-
-  let distMeters = 0;
-  const totalMeters = totalKm * 1000;
-  let lastTs: number | null = null;
-
-  function updateLegend(progressPct: number, currentStop: Stop) {
-    const el = document.getElementById('legend');
-    if (!el) return;
-    el.innerHTML = `Route: ${data.route}<br/>Progress: ${progressPct.toFixed(1)}%<br/>Current: ${currentStop.stop_name}`;
+  // Bus occupancy label (div icon hovering above the bus)
+  let busCapacity = 0;
+  let busOnboard = 0;
+  const makeBusLabelHTML = () => {
+    const cap = busCapacity || '?';
+    const occ = busOnboard;
+    const ratio = busCapacity > 0 ? occ / busCapacity : 0;
+    let color = '#2e7d32';
+    if (ratio >= 0.9) color = '#c62828';
+    else if (ratio >= 0.7) color = '#ef6c00';
+    else if (ratio >= 0.5) color = '#f9a825';
+  return `<div style=\"transform:translate(-40%, 80%);background:#fff;border:1px solid #111;padding:3px 8px;border-radius:6px;font-size:12px;line-height:1.05;font-family:monospace;font-weight:600;min-width:30px;text-align:center;box-shadow:0 1px 5px rgba(0,0,0,.45);\"><span style='color:${color};'>${occ}</span>/<span>${cap}</span></div>`;
+  };
+  const busLabel = L.marker(bus.getLatLng(), { interactive:false, icon: L.divIcon({ className:'bus-occupancy-label', html: makeBusLabelHTML() }) }).addTo(map);
+  function refreshBusLabel() {
+    (busLabel as any).setLatLng(bus.getLatLng());
+    (busLabel as any).setIcon(L.divIcon({ className:'bus-occupancy-label', html: makeBusLabelHTML() }));
   }
 
-  function frame(ts: number) {
-    if (lastTs == null) lastTs = ts;
-    const delta = ts - lastTs;
-    lastTs = ts;
-
-    distMeters += delta * metersPerMs;
-    if (distMeters >= totalMeters) {
-      distMeters = totalMeters;
-    }
-
-    // Determine segment
-    const distKm = distMeters / 1000;
-    let seg = segments[segments.length -1];
-    for (const s of segments) {
-      if (distKm >= s.cumulativeStart && distKm < s.cumulativeStart + s.lengthKm) { seg = s; break; }
-    }
-    const segProgress = Math.min(1, (distKm - seg.cumulativeStart) / seg.lengthKm);
-    const lat = interpolate(seg.from.latitute, seg.to.latitute, segProgress);
-    const lng = interpolate(seg.from.longtude, seg.to.longtude, segProgress);
-    bus.setLatLng([lat, lng]);
-
-    const progressPct = (distMeters / totalMeters) * 100;
-    updateLegend(progressPct, seg.from);
-
-    if (distMeters < totalMeters) requestAnimationFrame(frame);
-    else updateLegend(100, segments[segments.length -1].to);
-  }
-
-  updateLegend(0, stops[0]);
-  requestAnimationFrame(frame);
-
-  // Optional: click to restart
-  (routeLine as any).on('click', () => {
-    distMeters = 0; lastTs = null; requestAnimationFrame(frame);
+  // Add passenger count labels
+  const stopLabels: Record<number, L.Marker> = {};
+  stops.forEach(s => {
+    const id = s.stop_id;
+    const label = L.marker([s.latitute, s.longtude], {
+      icon: L.divIcon({ className: 'stop-count-label', html: `<div data-stop="${id}" style="transform: translate(-50%, -135%); background:#fff; padding:4px 6px; border:1px solid #222; border-radius:6px; font-size:11px; font-family:monospace; min-width:70px; text-align:center; box-shadow:0 1px 4px rgba(0,0,0,.4);"><div style='font-weight:600; white-space:nowrap;'>${s.stop_name}</div><div class='count' data-stop-count='${id}' style='margin-top:2px; font-size:12px;'>0</div></div>` })
+    });
+    label.addTo(map);
+    stopLabels[id] = label;
   });
+
+  function updateStopCount(id: number, value: number) {
+    const el = document.querySelector(`div[data-stop='${id}'] div[data-stop-count='${id}']`);
+    if (el) el.textContent = String(value);
+  }
+
+  // transient labels removed per new behavior request
+
+  function updateLegendText(text: string) {
+    const el = document.getElementById('legend');
+    if (el) el.innerHTML = text;
+  }
+  updateLegendText(`Route: ${data.route}<br/>Waiting for simulation...`);
+
+  // SSE connection
+    function openStream(): EventSource {
+      let es: EventSource;
+      try {
+        es = new EventSource('/api/stream');
+      } catch {
+        es = new EventSource('http://localhost:8080/api/stream');
+      }
+      return es;
+    }
+    let es = openStream();
+    let reconnectAttempts = 0;
+    function scheduleReconnect() {
+      if (reconnectAttempts > 5) return;
+      reconnectAttempts++;
+      const backoff = 1000 * reconnectAttempts;
+      updateLegendText(`Reconnecting... attempt ${reconnectAttempts}`);
+      setTimeout(() => {
+        es.close();
+        es = openStream();
+        attachHandlers();
+      }, backoff);
+    }
+
+    function attachHandlers() {
+      es.addEventListener('error', () => scheduleReconnect());
+      es.addEventListener('init', ev => {
+        reconnectAttempts = 0;
+        updateLegendText(`Route: ${data.route}<br/>Simulation started`);
+        try {
+          const d = JSON.parse((ev as MessageEvent).data);
+          if (d.bus) {
+            // Go JSON uses lower-case tags we normalized above; handle both shapes
+            const b = d.bus;
+            busCapacity = b?.type?.capacity ?? b?.Type?.capacity ?? b?.Type?.Capacity ?? busCapacity;
+            busOnboard = b?.passengers_onboard ?? b?.PassengersOnboard ?? 0;
+            refreshBusLabel();
+          }
+        } catch {}
+      });
+      es.addEventListener('arrive', ev => {
+        try {
+          const d = JSON.parse((ev as MessageEvent).data);
+          const st = stops.find(s => s.stop_id === d.stop_id);
+          if (st) {
+            // subtle pulse effect on arrival
+            const el = document.querySelector(`div[data-stop='${st.stop_id}']`);
+            if (el) {
+              el.classList.add('pulse');
+              setTimeout(()=> el.classList.remove('pulse'), 600);
+            }
+          }
+        } catch {}
+      });
+      es.addEventListener('move', ev => {
+        try {
+          const d = JSON.parse((ev as MessageEvent).data);
+          bus.setLatLng([d.lat, d.lng]);
+          refreshBusLabel();
+        } catch {}
+      });
+      es.addEventListener('stop_update', ev => {
+        try {
+          const d = JSON.parse((ev as MessageEvent).data);
+          updateStopCount(d.stop_id, d.outbound_queue);
+        } catch {}
+      });
+      es.addEventListener('alight', ev => {
+        try {
+          const d = JSON.parse((ev as MessageEvent).data);
+          if (typeof d.alighted === 'number') {
+            busOnboard = d.bus_onboard ?? (busOnboard - d.alighted);
+            if (busOnboard < 0) busOnboard = 0;
+            refreshBusLabel();
+          }
+        } catch {}
+      });
+      es.addEventListener('board', ev => {
+        try {
+          const d = JSON.parse((ev as MessageEvent).data);
+          if (typeof d.boarded === 'number') {
+            busOnboard = d.bus_onboard ?? (busOnboard + d.boarded);
+            if (busCapacity && busOnboard > busCapacity) busOnboard = busCapacity;
+            if (typeof d.stop_queue === 'number') updateStopCount(d.stop_id, d.stop_queue);
+            refreshBusLabel();
+          }
+        } catch {}
+      });
+      es.addEventListener('done', () => {
+        updateLegendText(`Route: ${data.route}<br/>Trip complete`);
+        es.close();
+      });
+    }
+    attachHandlers();
 }
 
 init().catch(err => console.error(err));

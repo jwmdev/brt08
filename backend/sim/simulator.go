@@ -160,6 +160,9 @@ func (s *Simulator) newPassenger(origin, dest int, arrival time.Time) *model.Pas
 	}
 }
 
+// NewPassengerPublic exposes passenger creation for streaming mode.
+func (s *Simulator) NewPassengerPublic(origin, dest int, arrival time.Time) *model.Passenger { return s.newPassenger(origin, dest, arrival) }
+
 // Poisson sample with mean using Knuth algorithm (suitable for moderate means).
 func (s *Simulator) poisson(mean float64) int {
 	if mean <= 0 { return 0 }
@@ -178,3 +181,6 @@ func (s *Simulator) poisson(mean float64) int {
 	}
 	return k - 1
 }
+
+// PoissonPublic exposes sampling for external stepwise simulation.
+func (s *Simulator) PoissonPublic(mean float64) int { return s.poisson(mean) }
