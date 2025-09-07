@@ -7,6 +7,10 @@ type BusStop struct {
     ID              int           `json:"id"`
     Name            string        `json:"name"`
     RouteID         int           `json:"route_id"`
+    Latitude        float64       `json:"latitute"`
+    Longitude       float64       `json:"longtude"`
+    DistanceToNext  float64       `json:"distance_next_stop"`
+    CumulativeDist  float64       `json:"cumulative_distance_km"`
     OutboundQueue   []*Passenger  `json:"outbound_queue,omitempty"`
     InboundQueue    []*Passenger  `json:"inbound_queue,omitempty"`
     TotalArrivals   int           `json:"total_arrivals"`

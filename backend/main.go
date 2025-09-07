@@ -3,52 +3,48 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"time"
 	"brt08/backend/model"
+	"brt08/backend/sim"
 )
 
 func main() {
-	bt := &model.BusType{ID: 1, Name: "Standard 12m", Capacity: 8, CostPerKm: 1.75}
-	bus := &model.Bus{ID: 1, Type: bt, RouteID: 100, CurrentStopID: 1, Direction: "outbound", AverageSpeedKmph: 32.5}
+	// Load route file
+	f, err := os.Open("data/kimara_kivukoni_stops.json")
+	if err != nil {
+		panic(err)
+	}
+	defer f.Close()
+	route, err := model.LoadRouteFromReader(f, 100)
+	if err != nil {
+		panic(err)
+	}
 
-	// Define three stops on the route
-	stop1 := &model.BusStop{ID: 1, Name: "Kimara", RouteID: 100}
-	stop2 := &model.BusStop{ID: 2, Name: "UBungo", RouteID: 100}
-	stop3 := &model.BusStop{ID: 3, Name: "Manzese", RouteID: 100}
+	bt := &model.BusType{ID: 1, Name: "Standard 12m", Capacity: 70, CostPerKm: 1.75}
+	bus := &model.Bus{ID: 1, Type: bt, RouteID: route.ID, CurrentStopID: route.Stops[0].ID, Direction: "outbound", AverageSpeedKmph: 28.0}
 
-	now := time.Now()
-	// Enqueue passengers at their origin stops (outbound direction)
-	stop1.EnqueuePassenger(&model.Passenger{ID: 1, RouteID: 100, StartStopID: 1, EndStopID: 3}, "outbound", now.Add(-6*time.Minute))
-	stop1.EnqueuePassenger(&model.Passenger{ID: 2, RouteID: 100, StartStopID: 1, EndStopID: 2}, "outbound", now.Add(-4*time.Minute))
-	stop2.EnqueuePassenger(&model.Passenger{ID: 3, RouteID: 100, StartStopID: 2, EndStopID: 3}, "outbound", now.Add(-3*time.Minute))
-	stop2.EnqueuePassenger(&model.Passenger{ID: 4, RouteID: 100, StartStopID: 2, EndStopID: 3}, "outbound", now.Add(-2*time.Minute))
-	stop3.EnqueuePassenger(&model.Passenger{ID: 5, RouteID: 100, StartStopID: 3, EndStopID: 2}, "inbound", now.Add(-5*time.Minute)) // inbound future trip
+	// Run stochastic simulation for this trip
+	start := time.Now()
+	simEngine := sim.NewSimulator(route, bus, time.Now().UnixNano(), 0.9, start)
+	simEngine.RunOnce()
 
-	// Arrive at stop1
-	bus.CurrentStopID = 1
-	boardedS1 := stop1.BoardAtStop(bus, now)
-	// Travel to stop2 (alight + board)
-	t2 := now.Add(5 * time.Minute)
-	bus.CurrentStopID = 2
-	alightedS2 := bus.AlightPassengersAtCurrentStop(t2)
-	boardedS2 := stop2.BoardAtStop(bus, t2)
-	// Travel to stop3
-	t3 := t2.Add(5 * time.Minute)
-	bus.CurrentStopID = 3
-	alightedS3 := bus.AlightPassengersAtCurrentStop(t3)
-	boardedS3 := stop3.BoardAtStop(bus, t3) // should board none outbound (only inbound queued)
+	// Collect stats slice in route order
+	stats := make([]*sim.StopStats, 0, len(route.Stops))
+	for _, sst := range route.Stops {
+		stats = append(stats, simEngine.Stats[sst.ID])
+	}
 
 	out := struct {
-		Bus       *model.Bus       `json:"bus"`
-		Stop1     *model.BusStop   `json:"stop1_final"`
-		Stop2     *model.BusStop   `json:"stop2_final"`
-		Stop3     *model.BusStop   `json:"stop3_final"`
-		BoardedS1 []*model.Passenger `json:"boarded_stop_1"`
-		AlightS2  []*model.Passenger `json:"alighted_stop_2"`
-		BoardedS2 []*model.Passenger `json:"boarded_stop_2"`
-		AlightS3  []*model.Passenger `json:"alighted_stop_3"`
-		BoardedS3 []*model.Passenger `json:"boarded_stop_3"`
-	}{bus, stop1, stop2, stop3, boardedS1, alightedS2, boardedS2, alightedS3, boardedS3}
+		RouteID        int              `json:"route_id"`
+		Bus            *model.Bus       `json:"bus"`
+		CompletedTrips int              `json:"completed_trips"`
+		EndOnboard     int              `json:"passengers_onboard_end"`
+		Stats          []*sim.StopStats `json:"stop_stats"`
+		TotalBoarded   int              `json:"total_boarded"`
+		TotalAlighted  int              `json:"total_alighted"`
+		SimEndTime     time.Time        `json:"simulation_end_time"`
+	}{route.ID, bus, len(simEngine.Completed), bus.PassengersOnboard, stats, bus.TotalBoarded, bus.TotalAlighted, simEngine.Now}
 
 	j, _ := json.MarshalIndent(out, "", "  ")
 	fmt.Println(string(j))
