@@ -1,0 +1,32 @@
+{
+  "route": "Kimara-Kivukoni",
+  "direction": "West_to_East",
+  "unit_distance": "kilometers",
+  "total_distance_km": 19.00,
+  "stops": [
+    { "stop_id": 1,  "stop_name": "Kimara",               "latitute": -6.78390, "longtude": 39.17840, "distance_next_stop": 0.99 },
+    { "stop_id": 2,  "stop_name": "Korogwe",              "latitute": -6.78490, "longtude": 39.18550, "distance_next_stop": 0.86 },
+    { "stop_id": 3,  "stop_name": "Bucha",                "latitute": -6.78570, "longtude": 39.19090, "distance_next_stop": 0.74 },
+    { "stop_id": 4,  "stop_name": "Baruti",               "latitute": -6.78620, "longtude": 39.19680, "distance_next_stop": 0.86 },
+    { "stop_id": 5,  "stop_name": "Kona",                 "latitute": -6.78740, "longtude": 39.20300, "distance_next_stop": 0.74 },
+    { "stop_id": 6,  "stop_name": "Kibo",                 "latitute": -6.78830, "longtude": 39.20870, "distance_next_stop": 0.74 },
+    { "stop_id": 7,  "stop_name": "Ubungo Maji",          "latitute": -6.78920, "longtude": 39.21430, "distance_next_stop": 0.62 },
+    { "stop_id": 8,  "stop_name": "Ubungo",               "latitute": -6.77250, "longtude": 39.20560, "distance_next_stop": 1.11 },
+    { "stop_id": 9,  "stop_name": "Shekilango",           "latitute": -6.79340, "longtude": 39.22010, "distance_next_stop": 0.99 },
+    { "stop_id": 10, "stop_name": "Urafiki",              "latitute": -6.79810, "longtude": 39.22760, "distance_next_stop": 1.11 },
+    { "stop_id": 11, "stop_name": "Tip Top",              "latitute": -6.80270, "longtude": 39.22220, "distance_next_stop": 0.86 },
+    { "stop_id": 12, "stop_name": "Manzese",              "latitute": -6.80390, "longtude": 39.23220, "distance_next_stop": 0.74 },
+    { "stop_id": 13, "stop_name": "Argentina",            "latitute": -6.80480, "longtude": 39.23770, "distance_next_stop": 0.99 },
+    { "stop_id": 14, "stop_name": "Mwembechai",           "latitute": -6.80640, "longtude": 39.24550, "distance_next_stop": 0.74 },
+    { "stop_id": 15, "stop_name": "Usalama",              "latitute": -6.80780, "longtude": 39.25070, "distance_next_stop": 0.86 },
+    { "stop_id": 16, "stop_name": "Magomeni",             "latitute": -6.79800, "longtude": 39.23610, "distance_next_stop": 1.48 },
+    { "stop_id": 17, "stop_name": "Jangwani",             "latitute": -6.81250, "longtude": 39.26550, "distance_next_stop": 0.74 },
+    { "stop_id": 18, "stop_name": "Fire",                 "latitute": -6.81140, "longtude": 39.27450, "distance_next_stop": 0.99 },
+    { "stop_id": 19, "stop_name": "DIT",                  "latitute": -6.81280, "longtude": 39.28230, "distance_next_stop": 0.62 },
+    { "stop_id": 20, "stop_name": "Kisutu",               "latitute": -6.81580, "longtude": 39.28570, "distance_next_stop": 0.49 },
+    { "stop_id": 21, "stop_name": "Halmashauri ya Jiji",  "latitute": -6.81750, "longtude": 39.28690, "distance_next_stop": 0.62 },
+    { "stop_id": 22, "stop_name": "Posta",                "latitute": -6.82050, "longtude": 39.28990, "distance_next_stop": 1.11 },
+    { "stop_id": 23, "stop_name": "Kivukoni",             "latitute": -6.82300, "longtude": 39.29860, "distance_next_stop": 0.00 }
+  ],
+  "note": "Copied to frontend for visualization"
+}
