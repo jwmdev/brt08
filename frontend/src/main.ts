@@ -7,12 +7,12 @@ async function loadRoute(): Promise<RouteData> {
   return res.json();
 }
 
-function createBusIcon(label: string) {
-  return L.divIcon({
-    className: 'bus-marker',
-    html: label,
-    iconSize: [18,18],
-    iconAnchor: [9,9]
+function createBusIcon() {
+  return L.icon({
+    iconUrl: '/img/bus.svg',
+    iconSize: [32,32],
+    iconAnchor: [16,16],
+    className: 'bus-svg-icon'
   });
 }
 
@@ -66,7 +66,7 @@ async function init() {
   const totalKm = segments.reduce((s, seg) => s + seg.lengthKm, 0);
 
   // Bus marker
-  const bus = L.marker([stops[0].latitute, stops[0].longtude], { icon: createBusIcon('A') }).addTo(map);
+  const bus = L.marker([stops[0].latitute, stops[0].longtude], { icon: createBusIcon() }).addTo(map);
 
   // Animation settings
   const speedKmph = 25; // simulation speed
