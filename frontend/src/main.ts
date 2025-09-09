@@ -175,26 +175,26 @@ async function init() {
   L.polyline(polyPoints, { color: '#1976d2', weight: 8, opacity: 0.9, lineJoin: 'round', lineCap: 'round' }).addTo(map);
   L.control.layers(baseLayers, {}, { position: 'topright', collapsed: true }).addTo(map);
 
-  // Bus marker for live updates
-  const firstStop = stops[0];
-  const bus = L.marker([firstStop.latitute, firstStop.longtude], { icon: createBusIcon() }).addTo(map);
-  // Bus occupancy label (div icon hovering above the bus)
-  let busCapacity = 0;
-  let busOnboard = 0;
-  const makeBusLabelHTML = () => {
-    const cap = busCapacity || '?';
-    const occ = busOnboard;
-    const ratio = busCapacity > 0 ? occ / busCapacity : 0;
+  // Dual bus markers (outbound + inbound)
+  interface BusState { id:number; direction:string; marker:L.Marker; label:L.Marker; capacity:number; onboard:number; }
+  const buses: Record<number, BusState> = {};
+  function makeBusLabelHTML(cap:number, onboard:number) {
+    const ratio = cap > 0 ? onboard / cap : 0;
     let color = '#2e7d32';
     if (ratio >= 0.9) color = '#c62828';
     else if (ratio >= 0.7) color = '#ef6c00';
     else if (ratio >= 0.5) color = '#f9a825';
-  return `<div style=\"transform:translate(-40%, 80%);background:#fff;border:1px solid #111;padding:3px 8px;border-radius:6px;font-size:12px;line-height:1.05;font-family:monospace;font-weight:600;min-width:30px;text-align:center;box-shadow:0 1px 5px rgba(0,0,0,.45);\"><span style='color:${color};'>${occ}</span>/<span>${cap}</span></div>`;
-  };
-  const busLabel = L.marker(bus.getLatLng(), { interactive:false, icon: L.divIcon({ className:'bus-occupancy-label', html: makeBusLabelHTML() }) }).addTo(map);
-  function refreshBusLabel() {
-    (busLabel as any).setLatLng(bus.getLatLng());
-    (busLabel as any).setIcon(L.divIcon({ className:'bus-occupancy-label', html: makeBusLabelHTML() }));
+    const capTxt = cap || '?';
+    return `<div style=\"transform:translate(-40%, 80%);background:#fff;border:1px solid #111;padding:3px 8px;border-radius:6px;font-size:12px;line-height:1.05;font-family:monospace;font-weight:600;min-width:30px;text-align:center;box-shadow:0 1px 5px rgba(0,0,0,.45);\"><span style='color:${color};'>${onboard}</span>/<span>${capTxt}</span></div>`;
+  }
+  function createBusState(id:number, direction:string, lat:number, lng:number, capacity:number, onboard:number): BusState {
+    const m = L.marker([lat,lng], { icon: createBusIcon(), title: `Bus ${id} (${direction})` }).addTo(map);
+    const lbl = L.marker([lat,lng], { interactive:false, icon: L.divIcon({ className:'bus-occupancy-label', html: makeBusLabelHTML(capacity,onboard) }) }).addTo(map);
+    return { id, direction, marker:m, label:lbl, capacity, onboard };
+  }
+  function refreshBus(b:BusState) {
+    b.label.setLatLng(b.marker.getLatLng());
+    b.label.setIcon(L.divIcon({ className:'bus-occupancy-label', html: makeBusLabelHTML(b.capacity,b.onboard) }));
   }
 
   // Add passenger count labels
@@ -208,9 +208,12 @@ async function init() {
     stopLabels[id] = label;
   });
 
-  function updateStopCount(id: number, value: number) {
+  function updateStopCount(id: number, outbound: number, inbound?: number) {
     const el = document.querySelector(`div[data-stop='${id}'] div[data-stop-count='${id}']`);
-    if (el) el.textContent = String(value);
+    if (el) {
+      if (inbound == null) el.textContent = String(outbound);
+      else el.textContent = `${outbound}/${inbound}`; // show outbound/inbound
+    }
   }
 
   // transient labels removed per new behavior request
@@ -252,12 +255,17 @@ async function init() {
         updateLegendText(`Route: ${data.route}<br/>Simulation started`);
         try {
           const d = JSON.parse((ev as MessageEvent).data);
-          if (d.bus) {
-            // Go JSON uses lower-case tags we normalized above; handle both shapes
-            const b = d.bus;
-            busCapacity = b?.type?.capacity ?? b?.Type?.capacity ?? b?.Type?.Capacity ?? busCapacity;
-            busOnboard = b?.passengers_onboard ?? b?.PassengersOnboard ?? 0;
-            refreshBusLabel();
+          if (Array.isArray(d.buses)) {
+            d.buses.forEach((b: any) => {
+              const id = b.id ?? b.ID;
+              const dir = b.direction ?? b.Direction ?? 'outbound';
+              const cap = b?.type?.capacity ?? b?.Type?.capacity ?? b?.Type?.Capacity ?? 0;
+              const onboard = b.passengers_onboard ?? b.PassengersOnboard ?? 0;
+              // initial position: first stop for outbound, last stop for inbound
+              let lat = stops[0].latitute, lng = stops[0].longtude;
+              if (dir === 'inbound') { lat = stops[stops.length-1].latitute; lng = stops[stops.length-1].longtude; }
+              buses[id] = createBusState(id, dir, lat, lng, cap, onboard);
+            });
           }
         } catch {}
       });
@@ -272,30 +280,32 @@ async function init() {
               el.classList.add('pulse');
               setTimeout(()=> el.classList.remove('pulse'), 600);
             }
+            if (typeof d.outbound_queue === 'number') {
+              updateStopCount(st.stop_id, d.outbound_queue, d.inbound_queue);
+            }
           }
         } catch {}
       });
       es.addEventListener('move', ev => {
         try {
           const d = JSON.parse((ev as MessageEvent).data);
-          bus.setLatLng([d.lat, d.lng]);
-          refreshBusLabel();
+          const b = buses[d.bus_id];
+          if (b) { b.marker.setLatLng([d.lat, d.lng]); refreshBus(b); }
         } catch {}
       });
       es.addEventListener('stop_update', ev => {
         try {
           const d = JSON.parse((ev as MessageEvent).data);
           const stp = stops.find(s => s.stop_id === d.stop_id);
-          if (stp) updateStopCount(d.stop_id, d.outbound_queue);
+          if (stp) updateStopCount(d.stop_id, d.outbound_queue, d.inbound_queue);
         } catch {}
       });
       es.addEventListener('alight', ev => {
         try {
           const d = JSON.parse((ev as MessageEvent).data);
           if (typeof d.alighted === 'number') {
-            busOnboard = d.bus_onboard ?? (busOnboard - d.alighted);
-            if (busOnboard < 0) busOnboard = 0;
-            refreshBusLabel();
+            const b = buses[d.bus_id];
+            if (b) { b.onboard = d.bus_onboard ?? (b.onboard - d.alighted); if (b.onboard < 0) b.onboard = 0; refreshBus(b); }
           }
         } catch {}
       });
@@ -303,10 +313,15 @@ async function init() {
         try {
           const d = JSON.parse((ev as MessageEvent).data);
           if (typeof d.boarded === 'number') {
-            busOnboard = d.bus_onboard ?? (busOnboard + d.boarded);
-            if (busCapacity && busOnboard > busCapacity) busOnboard = busCapacity;
-            if (typeof d.stop_queue === 'number') updateStopCount(d.stop_id, d.stop_queue);
-            refreshBusLabel();
+            const b = buses[d.bus_id];
+            if (b) {
+              b.onboard = d.bus_onboard ?? (b.onboard + d.boarded);
+              if (b.capacity && b.onboard > b.capacity) b.onboard = b.capacity;
+              refreshBus(b);
+            }
+            const outboundQ = d.stop_outbound ?? d.outbound_queue ?? d.stop_queue;
+            const inboundQ = d.stop_inbound ?? d.inbound_queue;
+            if (typeof outboundQ === 'number') updateStopCount(d.stop_id, outboundQ, typeof inboundQ === 'number' ? inboundQ : undefined);
           }
         } catch {}
       });

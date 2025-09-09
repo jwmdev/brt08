@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sync"
 	"time"
 	"brt08/backend/model"
 	"brt08/backend/sim"
@@ -24,7 +25,9 @@ func main() {
 	}
 
 	bt := &model.BusType{ID: 1, Name: "Standard 12m", Capacity: 70, CostPerKm: 1.75}
-	bus := &model.Bus{ID: 1, Type: bt, RouteID: route.ID, CurrentStopID: route.Stops[0].ID, Direction: "outbound", AverageSpeedKmph: 28.0}
+	// Template buses (one per direction)
+	busOutbound := &model.Bus{ID: 1, Type: bt, RouteID: route.ID, CurrentStopID: route.Stops[0].ID, Direction: "outbound", AverageSpeedKmph: 28.0}
+	busInbound := &model.Bus{ID: 2, Type: bt, RouteID: route.ID, CurrentStopID: route.Stops[len(route.Stops)-1].ID, Direction: "inbound", AverageSpeedKmph: 28.0}
 
 	http.HandleFunc("/api/route", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -33,7 +36,7 @@ func main() {
 		w.Write(j)
 	})
 
-	http.HandleFunc("/api/stream", func(w http.ResponseWriter, r *http.Request) {
+		http.HandleFunc("/api/stream", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
@@ -41,100 +44,172 @@ func main() {
 		flusher, ok := w.(http.Flusher)
 		if !ok { http.Error(w, "stream unsupported", 500); return }
 
-		// Per-connection bus clone
-		connBus := &model.Bus{ID: bus.ID, Type: bus.Type, RouteID: route.ID, CurrentStopID: route.Stops[0].ID, Direction: "outbound", AverageSpeedKmph: bus.AverageSpeedKmph}
-		start := time.Now()
-		engine := sim.NewSimulator(route, connBus, time.Now().UnixNano(), 1.2, start) // slightly higher arrival rate for visibility
+			// Per-connection bus clones
+			outBus := &model.Bus{ID: busOutbound.ID, Type: busOutbound.Type, RouteID: route.ID, CurrentStopID: route.Stops[0].ID, Direction: "outbound", AverageSpeedKmph: busOutbound.AverageSpeedKmph}
+			inBus := &model.Bus{ID: busInbound.ID, Type: busInbound.Type, RouteID: route.ID, CurrentStopID: route.Stops[len(route.Stops)-1].ID, Direction: "inbound", AverageSpeedKmph: busInbound.AverageSpeedKmph}
+			start := time.Now()
+			engine := sim.NewSimulator(route, outBus, time.Now().UnixNano(), 1.2, start)
 
+		// Serialize all writes to ResponseWriter; Go net/http forbids concurrent writes.
+		var writeMu sync.Mutex
 		flush := func(event string, payload any) {
+			writeMu.Lock()
 			b, _ := json.Marshal(payload)
 			fmt.Fprintf(w, "event: %s\n", event)
 			fmt.Fprintf(w, "data: %s\n\n", b)
 			flusher.Flush()
+			writeMu.Unlock()
 		}
 
-		// Seed initial queues (3 min lookback) & send initial stop states (skip pins)
-		seedWindow := 3.0
-		for i := 0; i < len(route.Stops)-1; i++ {
-			origin := route.Stops[i]
-			count := engine.PoissonPublic(engine.LambdaPerMinute * seedWindow)
-			if count == 0 { continue }
-			for j := 0; j < count; j++ {
-				destIndex := i + 1 + engine.RNG.Intn(len(route.Stops)-i-1)
-				dest := route.Stops[destIndex]
-				arrTime := start.Add(-time.Duration(engine.RNG.Float64()*seedWindow*float64(time.Minute)))
-				p := engine.NewPassengerPublic(origin.ID, dest.ID, arrTime)
-				origin.EnqueuePassenger(p, "outbound", arrTime)
+			// Shared lock for stop queues
+			var mu sync.Mutex
+			seedWindow := 3.0
+			// Seed outbound passengers
+			for i := 0; i < len(route.Stops)-1; i++ {
+				origin := route.Stops[i]
+				count := engine.PoissonPublic(engine.LambdaPerMinute * seedWindow)
+				for j := 0; j < count; j++ {
+					destIndex := i + 1 + engine.RNG.Intn(len(route.Stops)-i-1)
+					dest := route.Stops[destIndex]
+					arrTime := start.Add(-time.Duration(engine.RNG.Float64()*seedWindow*float64(time.Minute)))
+					p := engine.NewPassengerPublic(origin.ID, dest.ID, arrTime)
+					p.Direction = "outbound"
+					origin.EnqueuePassenger(p, "outbound", arrTime)
+				}
 			}
-		}
-		for _, st := range route.Stops {
-			flush("stop_update", map[string]any{"stop_id": st.ID, "outbound_queue": len(st.OutboundQueue)})
-		}
+			// Seed inbound passengers
+			for i := len(route.Stops)-1; i > 0; i-- {
+				origin := route.Stops[i]
+				count := engine.PoissonPublic(engine.LambdaPerMinute * seedWindow / 1.2) // maybe slightly lower inbound
+				for j := 0; j < count; j++ {
+					destIndex := engine.RNG.Intn(i) // 0 .. i-1
+					dest := route.Stops[destIndex]
+					arrTime := start.Add(-time.Duration(engine.RNG.Float64()*seedWindow*float64(time.Minute)))
+					p := engine.NewPassengerPublic(origin.ID, dest.ID, arrTime)
+					p.Direction = "inbound"
+					origin.EnqueuePassenger(p, "inbound", arrTime)
+				}
+			}
+			for _, st := range route.Stops {
+				flush("stop_update", map[string]any{"stop_id": st.ID, "outbound_queue": len(st.OutboundQueue), "inbound_queue": len(st.InboundQueue)})
+			}
 
-		engine.Now = start
-		flush("init", map[string]any{"time": engine.Now, "bus": connBus, "message": "started"})
-		flush("move", map[string]any{"lat": route.Stops[0].Latitude, "lng": route.Stops[0].Longitude, "from": 0, "to": route.Stops[0].ID, "t": 0})
+			engine.Now = start
+			flush("init", map[string]any{"time": engine.Now, "buses": []any{outBus, inBus}, "message": "started"})
+			flush("move", map[string]any{"bus_id": outBus.ID, "direction": outBus.Direction, "lat": route.Stops[0].Latitude, "lng": route.Stops[0].Longitude, "from": 0, "to": route.Stops[0].ID, "t": 0})
+			flush("move", map[string]any{"bus_id": inBus.ID, "direction": inBus.Direction, "lat": route.Stops[len(route.Stops)-1].Latitude, "lng": route.Stops[len(route.Stops)-1].Longitude, "from": 0, "to": route.Stops[len(route.Stops)-1].ID, "t": 0})
 
-		for idx := 0; idx < len(route.Stops); idx++ {
-			stop := route.Stops[idx]
-			flush("arrive", map[string]any{"stop_id": stop.ID, "outbound_queue": len(stop.OutboundQueue), "time": engine.Now})
-			// Process dwell/boarding (all stops now real; pins moved to separate array)
-			alightedCount := 0
-			boardedCount := 0
-			{
-				constPauseAlight := 300 * time.Millisecond
-				constPauseBoard := 300 * time.Millisecond
-				alighted := connBus.AlightPassengersAtCurrentStop(engine.Now)
-				if len(alighted) > 0 {
-					alightedCount = len(alighted)
-					flush("alight", map[string]any{"stop_id": stop.ID, "alighted": alightedCount, "bus_onboard": connBus.PassengersOnboard})
-					time.Sleep(constPauseAlight)
-					engine.Now = engine.Now.Add(constPauseAlight)
-				}
-				boarded := stop.BoardAtStop(connBus, engine.Now)
-				if len(boarded) > 0 {
-					boardedCount = len(boarded)
-					flush("board", map[string]any{"stop_id": stop.ID, "boarded": boardedCount, "bus_onboard": connBus.PassengersOnboard, "stop_queue": len(stop.OutboundQueue)})
-					time.Sleep(constPauseBoard)
-					engine.Now = engine.Now.Add(constPauseBoard)
-				}
-				flush("stop_update", map[string]any{"stop_id": stop.ID, "outbound_queue": len(stop.OutboundQueue)})
-				if idx == len(route.Stops)-1 { break }
-				baseDwell := 1500*time.Millisecond + time.Duration(boardedCount)*200*time.Millisecond
-				if baseDwell > 0 {
-					flush("dwell", map[string]any{"stop_id": stop.ID, "remaining_ms": baseDwell.Milliseconds()})
-					time.Sleep(baseDwell)
-					engineGenerateArrivals(engine, engine.Now, engine.Now.Add(baseDwell), idx+1, flush)
-					engine.Now = engine.Now.Add(baseDwell)
+			var wg sync.WaitGroup
+			wg.Add(2)
+
+			simulate := func(bus *model.Bus, forward bool) {
+				defer wg.Done()
+					computeDwell := func(boardedN, alightedN int) time.Duration {
+						// Base dwell plus small increment per passenger, capped.
+						base := 1200 * time.Millisecond
+						per := time.Duration(300 * time.Millisecond) * time.Duration(boardedN+alightedN)
+						max := 4 * time.Second
+						d := base + per
+						if d > max { d = max }
+						return d
+					}
+				if forward {
+					for idx := 0; idx < len(route.Stops); idx++ {
+						stop := route.Stops[idx]
+						mu.Lock()
+							flush("arrive", map[string]any{"bus_id": bus.ID, "direction": bus.Direction, "stop_id": stop.ID, "outbound_queue": len(stop.OutboundQueue), "inbound_queue": len(stop.InboundQueue), "time": engine.Now, "bus_onboard": bus.PassengersOnboard, "passengers_onboard": bus.PassengersOnboard})
+							alighted := bus.AlightPassengersAtCurrentStop(engine.Now)
+							if len(alighted) > 0 { flush("alight", map[string]any{"bus_id": bus.ID, "direction": bus.Direction, "stop_id": stop.ID, "alighted": len(alighted), "bus_onboard": bus.PassengersOnboard, "passengers_onboard": bus.PassengersOnboard}) }
+							boarded := stop.BoardAtStop(bus, engine.Now)
+							if len(boarded) > 0 {
+								flush("board", map[string]any{"bus_id": bus.ID, "direction": bus.Direction, "stop_id": stop.ID, "boarded": len(boarded), "bus_onboard": bus.PassengersOnboard, "passengers_onboard": bus.PassengersOnboard, "stop_outbound": len(stop.OutboundQueue), "stop_inbound": len(stop.InboundQueue)})
+							}
+							flush("stop_update", map[string]any{"stop_id": stop.ID, "outbound_queue": len(stop.OutboundQueue), "inbound_queue": len(stop.InboundQueue)})
+							// compute dwell inside lock (using counts), then unlock before sleeping
+							dwell := computeDwell(len(boarded), len(alighted))
+							mu.Unlock()
+							var avgWait float64
+							if len(boarded) > 0 {
+								var sum float64
+								for _, p := range boarded { if p.WaitDuration != nil { sum += *p.WaitDuration } }
+								avgWait = sum / float64(len(boarded))
+							}
+							log.Printf("STOP %d %s | alight=%d board=%d onboard=%d dwell=%v avg_wait=%.2fmin\n", stop.ID, stop.Name, len(alighted), len(boarded), bus.PassengersOnboard, dwell, avgWait)
+							flush("dwell", map[string]any{"bus_id": bus.ID, "direction": bus.Direction, "stop_id": stop.ID, "alighted": len(alighted), "boarded": len(boarded), "bus_onboard": bus.PassengersOnboard, "dwell_ms": dwell.Milliseconds()})
+							time.Sleep(dwell)
+						if idx == len(route.Stops)-1 { break }
+						next := route.Stops[idx+1]
+						dist := stop.DistanceToNext
+						travelMin := dist / bus.AverageSpeedKmph * 60
+						travelDur := time.Duration(travelMin * float64(time.Minute))
+						steps := int(travelDur / (800 * time.Millisecond))
+						if steps < 1 { steps = 1 }
+						for sstep := 1; sstep <= steps; sstep++ {
+							t := float64(sstep) / float64(steps)
+							lat := stop.Latitude + (next.Latitude-stop.Latitude)*t
+							lng := stop.Longitude + (next.Longitude-stop.Longitude)*t
+							flush("move", map[string]any{"bus_id": bus.ID, "direction": bus.Direction, "lat": lat, "lng": lng, "t": t, "from": stop.ID, "to": next.ID})
+							time.Sleep(120 * time.Millisecond)
+						}
+						bus.CurrentStopID = next.ID
+					}
+					// final alight
+					mu.Lock()
+					alighted := bus.AlightPassengersAtCurrentStop(engine.Now)
+					if len(alighted) > 0 { flush("alight", map[string]any{"bus_id": bus.ID, "direction": bus.Direction, "stop_id": bus.CurrentStopID, "alighted": len(alighted), "bus_onboard": bus.PassengersOnboard, "passengers_onboard": bus.PassengersOnboard, "final": true}) }
+					mu.Unlock()
+				} else { // inbound (reverse)
+						for ridx := len(route.Stops)-1; ridx >= 0; ridx-- {
+						stop := route.Stops[ridx]
+						mu.Lock()
+							flush("arrive", map[string]any{"bus_id": bus.ID, "direction": bus.Direction, "stop_id": stop.ID, "outbound_queue": len(stop.OutboundQueue), "inbound_queue": len(stop.InboundQueue), "time": engine.Now, "bus_onboard": bus.PassengersOnboard, "passengers_onboard": bus.PassengersOnboard})
+							alighted := bus.AlightPassengersAtCurrentStop(engine.Now)
+							if len(alighted) > 0 { flush("alight", map[string]any{"bus_id": bus.ID, "direction": bus.Direction, "stop_id": stop.ID, "alighted": len(alighted), "bus_onboard": bus.PassengersOnboard, "passengers_onboard": bus.PassengersOnboard}) }
+							boarded := stop.BoardAtStop(bus, engine.Now)
+							if len(boarded) > 0 {
+								flush("board", map[string]any{"bus_id": bus.ID, "direction": bus.Direction, "stop_id": stop.ID, "boarded": len(boarded), "bus_onboard": bus.PassengersOnboard, "passengers_onboard": bus.PassengersOnboard, "stop_outbound": len(stop.OutboundQueue), "stop_inbound": len(stop.InboundQueue)})
+							}
+							flush("stop_update", map[string]any{"stop_id": stop.ID, "outbound_queue": len(stop.OutboundQueue), "inbound_queue": len(stop.InboundQueue)})
+							dwell := computeDwell(len(boarded), len(alighted))
+							mu.Unlock()
+							var avgWait2 float64
+							if len(boarded) > 0 {
+								var sum2 float64
+								for _, p := range boarded { if p.WaitDuration != nil { sum2 += *p.WaitDuration } }
+								avgWait2 = sum2 / float64(len(boarded))
+							}
+							log.Printf("STOP %d %s | alight=%d board=%d onboard=%d dwell=%v avg_wait=%.2fmin\n", stop.ID, stop.Name, len(alighted), len(boarded), bus.PassengersOnboard, dwell, avgWait2)
+							flush("dwell", map[string]any{"bus_id": bus.ID, "direction": bus.Direction, "stop_id": stop.ID, "alighted": len(alighted), "boarded": len(boarded), "bus_onboard": bus.PassengersOnboard, "dwell_ms": dwell.Milliseconds()})
+							time.Sleep(dwell)
+						if ridx == 0 { break }
+						prev := route.Stops[ridx-1]
+						// Distance from prev to current stored in prev.DistanceToNext; for reverse use prev.DistanceToNext
+						dist := prev.DistanceToNext
+						travelMin := dist / bus.AverageSpeedKmph * 60
+						travelDur := time.Duration(travelMin * float64(time.Minute))
+						steps := int(travelDur / (800 * time.Millisecond))
+						if steps < 1 { steps = 1 }
+						for sstep := 1; sstep <= steps; sstep++ {
+							t := float64(sstep) / float64(steps)
+							lat := stop.Latitude + (prev.Latitude-stop.Latitude)*t
+							lng := stop.Longitude + (prev.Longitude-stop.Longitude)*t
+							flush("move", map[string]any{"bus_id": bus.ID, "direction": bus.Direction, "lat": lat, "lng": lng, "t": t, "from": stop.ID, "to": prev.ID})
+							time.Sleep(120 * time.Millisecond)
+						}
+						bus.CurrentStopID = prev.ID
+					}
+					mu.Lock()
+					alighted := bus.AlightPassengersAtCurrentStop(engine.Now)
+					if len(alighted) > 0 { flush("alight", map[string]any{"bus_id": bus.ID, "direction": bus.Direction, "stop_id": bus.CurrentStopID, "alighted": len(alighted), "bus_onboard": bus.PassengersOnboard, "passengers_onboard": bus.PassengersOnboard, "final": true}) }
+					mu.Unlock()
 				}
 			}
-			if idx == len(route.Stops)-1 {
-				// Final stop: force remaining onboard passengers to alight here.
-				connBus.CurrentStopID = stop.ID
-				alightedFinal := connBus.AlightPassengersAtCurrentStop(engine.Now)
-				if len(alightedFinal) > 0 {
-					flush("alight", map[string]any{"stop_id": stop.ID, "alighted": len(alightedFinal), "bus_onboard": connBus.PassengersOnboard, "final": true})
-				}
-				break
-			}
-			next := route.Stops[idx+1]
-			dist := stop.DistanceToNext
-			travelMin := dist / connBus.AverageSpeedKmph * 60
-			travelDur := time.Duration(travelMin * float64(time.Minute))
-			steps := int(travelDur / (800 * time.Millisecond))
-			if steps < 1 { steps = 1 }
-			for sstep := 1; sstep <= steps; sstep++ {
-				t := float64(sstep) / float64(steps)
-				lat := stop.Latitude + (next.Latitude-stop.Latitude)*t
-				lng := stop.Longitude + (next.Longitude-stop.Longitude)*t
-				flush("move", map[string]any{"lat": lat, "lng": lng, "t": t, "from": stop.ID, "to": next.ID})
-				time.Sleep(120 * time.Millisecond)
-				engineGenerateArrivals(engine, engine.Now, engine.Now.Add(120*time.Millisecond), idx+1, flush)
-				engine.Now = engine.Now.Add(120 * time.Millisecond)
-			}
-			connBus.CurrentStopID = next.ID
-		}
-		flush("done", map[string]any{"completed": true})
+
+			go simulate(outBus, true)
+			go simulate(inBus, false)
+
+			wg.Wait()
+			flush("done", map[string]any{"completed": true})
 	})
 
 	log.Println("Serving on :8080")
