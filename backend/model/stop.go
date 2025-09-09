@@ -27,6 +27,8 @@ func (s *BusStop) EnqueuePassenger(p *Passenger, dir string, now time.Time) {
         p.ArrivalStopTime = now
     }
     s.TotalArrivals++
+    // If explicit direction passed differs from passenger's set direction, trust passenger.
+    if p.Direction != "" { dir = p.Direction }
     if dir == "inbound" {
         s.InboundQueue = append(s.InboundQueue, p)
     } else { // default outbound
@@ -62,7 +64,7 @@ func (s *BusStop) BoardAtStop(bus *Bus, now time.Time) []*Passenger {
             newQueue = append(newQueue, p)
             continue
         }
-        if p.RouteID == bus.RouteID && p.StartStopID == s.ID && p.BoardingTime == nil {
+    if p.RouteID == bus.RouteID && p.StartStopID == s.ID && p.BoardingTime == nil && (p.Direction == "" || p.Direction == bus.Direction) {
             p.MarkBoarded(now)
             bus.Passengers = append(bus.Passengers, p)
             boarded = append(boarded, p)

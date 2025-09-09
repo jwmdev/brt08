@@ -8,6 +8,7 @@ type Passenger struct {
     RouteID           int        `json:"route_id"`
     StartStopID       int        `json:"start_stop_id"`
     EndStopID         int        `json:"end_stop_id"`
+    Direction         string     `json:"direction"` // "outbound" or "inbound"
     ArrivalStopTime   time.Time  `json:"arrival_stop_time"`   // when passenger arrived at origin stop (intending to travel)
     BoardingTime      *time.Time `json:"boarding_time,omitempty"`      // when passenger actually boarded a bus
     WaitDuration      *float64   `json:"wait_duration_minutes,omitempty"` // (BoardingTime - ArrivalStopTime) in minutes

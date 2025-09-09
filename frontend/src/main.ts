@@ -58,7 +58,13 @@ async function init() {
     stop_name: s.stop_name ?? s.name,
     latitute: s.latitute,
     longtude: s.longtude,
-    distance_next_stop: s.distance_next_stop ?? s.distance_to_next ?? s.DistanceToNext ?? 0
+    distance_next_stop: s.distance_next_stop ?? s.distance_to_next ?? s.DistanceToNext ?? 0,
+  }));
+  const pins = (data.pins || []).map((p: any) => ({
+    left_stop_id: p.left_stop_id,
+    right_stop_id: p.right_stop_id,
+    latitute: p.latitute,
+    longtude: p.longtude,
   }));
 
   // Provide route level fallbacks
@@ -66,23 +72,112 @@ async function init() {
   data.direction = data.direction || 'outbound';
 
   const map = L.map('map');
-  const osm = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-    maxZoom: 19,
+  // Define multiple detailed base layers
+  const osmStandard = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 20,
     attribution: '&copy; OpenStreetMap contributors'
   });
-  osm.addTo(map);
+  const osmHot = L.tileLayer('https://{s}.tile.openstreetmap.fr/hot/{z}/{x}/{y}.png', {
+    maxZoom: 20,
+    attribution: '© OpenStreetMap contributors, Tiles style by Humanitarian OpenStreetMap Team hosted by OSM France'
+  });
+  const cartoVoyager = L.tileLayer('https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png', {
+    maxZoom: 20,
+    attribution: '© OpenStreetMap contributors © CARTO'
+  });
+  const openTopo = L.tileLayer('https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png', {
+    maxZoom: 17,
+    attribution: '© OpenStreetMap contributors, SRTM | Style: © OpenTopoMap (CC-BY-SA)'
+  });
+  // Choose a more detailed / legible default (Carto Voyager)
+  cartoVoyager.addTo(map);
+  const baseLayers: Record<string, L.TileLayer> = {
+    'Carto Voyager': cartoVoyager,
+    'OSM Standard': osmStandard,
+    'OSM HOT': osmHot,
+    'OpenTopoMap': openTopo,
+  };
 
   // Fit map to stops bounds
-  const group = L.featureGroup(stops.map(createStopMarker));
+  const visibleStopMarkers = stops.map(createStopMarker);
+  const group = L.featureGroup(visibleStopMarkers);
   group.addTo(map);
   map.fitBounds(group.getBounds().pad(0.15));
 
-  // Draw polyline
-  const polylineLatLngs = stops.map(s => [s.latitute, s.longtude]) as [number, number][];
-  const routeLine = L.polyline(polylineLatLngs, { color: '#1976d2', weight: 4, opacity: 0.8 }).addTo(map);
+  // Original centripetal Catmull-Rom spline that passes through every original point.
+  function catmullRom(points: [number, number][], segmentsPerEdge = 16): [number, number][] {
+    if (points.length < 3) return points;
+    const pts: [number, number][] = [];
+    const clamp = (i: number) => {
+      if (i < 0) return points[0];
+      if (i >= points.length) return points[points.length - 1];
+      return points[i];
+    };
+    for (let i = 0; i < points.length - 1; i++) {
+      const P0 = clamp(i - 1);
+      const P1 = clamp(i);
+      const P2 = clamp(i + 1);
+      const P3 = clamp(i + 2);
+      if (i === 0) pts.push([P1[0], P1[1]]);
+      for (let s = 1; s <= segmentsPerEdge; s++) {
+        const t = s / segmentsPerEdge;
+        const t2 = t * t;
+        const t3 = t2 * t;
+        const x = 0.5 * ((2 * P1[0]) + (-P0[0] + P2[0]) * t + (2*P0[0] - 5*P1[0] + 4*P2[0] - P3[0]) * t2 + (-P0[0] + 3*P1[0] - 3*P2[0] + P3[0]) * t3);
+        const y = 0.5 * ((2 * P1[1]) + (-P0[1] + P2[1]) * t + (2*P0[1] - 5*P1[1] + 4*P2[1] - P3[1]) * t2 + (-P0[1] + 3*P1[1] - 3*P2[1] + P3[1]) * t3);
+        if (Number.isFinite(x) && Number.isFinite(y)) {
+          pts.push([x, y]);
+        } else {
+          pts.push([P2[0], P2[1]]);
+        }
+      }
+    }
+    const last = points[points.length - 1];
+    const tail = pts[pts.length - 1];
+    if (!tail || tail[0] !== last[0] || tail[1] !== last[1]) pts.push(last);
+    return pts;
+  }
+  // Build geometry list inserting pins between their referenced stops
+  const stopIndex: Record<number, number> = {};
+  stops.forEach((s, i) => { stopIndex[s.stop_id] = i; });
+  const rawPoints: [number, number][] = [];
+  for (let i=0; i<stops.length; i++) {
+    const s = stops[i];
+    rawPoints.push([s.latitute, s.longtude]);
+    // find pins whose left_stop_id is this stop and right matches next stop
+    const next = stops[i+1];
+    if (next) {
+  (pins as {left_stop_id:number; right_stop_id:number; latitute:number; longtude:number;}[]).forEach(p => {
+        if (p.left_stop_id === s.stop_id && p.right_stop_id === next.stop_id) {
+          rawPoints.push([p.latitute, p.longtude]);
+        }
+      });
+    }
+  }
+  let polyPoints: [number, number][] = rawPoints;
+  try {
+    // filter consecutive duplicates
+    const dedup: [number, number][] = [];
+    for (const p of rawPoints) {
+      if (!dedup.length || dedup[dedup.length - 1][0] !== p[0] || dedup[dedup.length - 1][1] !== p[1]) dedup.push(p);
+    }
+  polyPoints = catmullRom(dedup, 16); // revert: stronger sampling with original spline
+    // Ensure all original stops are in the polyline sequence (for hit-testing / pass-through guarantee)
+    for (const orig of dedup) {
+      let contained = false;
+      for (const pp of polyPoints) { if (Math.abs(pp[0]-orig[0]) < 1e-9 && Math.abs(pp[1]-orig[1]) < 1e-9) { contained = true; break; } }
+      if (!contained) polyPoints.push(orig);
+    }
+  } catch (e) {
+    console.warn('smoothing failed, using raw path', e);
+    polyPoints = rawPoints;
+  }
+  L.polyline(polyPoints, { color: '#1976d2', weight: 8, opacity: 0.9, lineJoin: 'round', lineCap: 'round' }).addTo(map);
+  L.control.layers(baseLayers, {}, { position: 'topright', collapsed: true }).addTo(map);
 
   // Bus marker for live updates
-  const bus = L.marker([stops[0].latitute, stops[0].longtude], { icon: createBusIcon() }).addTo(map);
+  const firstStop = stops[0];
+  const bus = L.marker([firstStop.latitute, firstStop.longtude], { icon: createBusIcon() }).addTo(map);
   // Bus occupancy label (div icon hovering above the bus)
   let busCapacity = 0;
   let busOnboard = 0;
@@ -190,7 +285,8 @@ async function init() {
       es.addEventListener('stop_update', ev => {
         try {
           const d = JSON.parse((ev as MessageEvent).data);
-          updateStopCount(d.stop_id, d.outbound_queue);
+          const stp = stops.find(s => s.stop_id === d.stop_id);
+          if (stp) updateStopCount(d.stop_id, d.outbound_queue);
         } catch {}
       });
       es.addEventListener('alight', ev => {

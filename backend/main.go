@@ -53,12 +53,12 @@ func main() {
 			flusher.Flush()
 		}
 
-		// Seed initial queues (3 min lookback) & send initial stop states
+		// Seed initial queues (3 min lookback) & send initial stop states (skip pins)
 		seedWindow := 3.0
 		for i := 0; i < len(route.Stops)-1; i++ {
+			origin := route.Stops[i]
 			count := engine.PoissonPublic(engine.LambdaPerMinute * seedWindow)
 			if count == 0 { continue }
-			origin := route.Stops[i]
 			for j := 0; j < count; j++ {
 				destIndex := i + 1 + engine.RNG.Intn(len(route.Stops)-i-1)
 				dest := route.Stops[destIndex]
@@ -77,41 +77,46 @@ func main() {
 
 		for idx := 0; idx < len(route.Stops); idx++ {
 			stop := route.Stops[idx]
-			// Emit explicit arrival event (first stop included)
 			flush("arrive", map[string]any{"stop_id": stop.ID, "outbound_queue": len(stop.OutboundQueue), "time": engine.Now})
-			// Small pauses to visualize sequence with minimal added dwell
-			const pauseAfterAlight = 500 * time.Millisecond
-			const pauseAfterBoard = 500 * time.Millisecond
-
-			alighted := connBus.AlightPassengersAtCurrentStop(engine.Now)
-			consumedPause := time.Duration(0)
-			if len(alighted) > 0 {
-				flush("alight", map[string]any{"stop_id": stop.ID, "alighted": len(alighted), "bus_onboard": connBus.PassengersOnboard})
-				time.Sleep(pauseAfterAlight)
-				engine.Now = engine.Now.Add(pauseAfterAlight)
-				consumedPause += pauseAfterAlight
+			// Process dwell/boarding (all stops now real; pins moved to separate array)
+			alightedCount := 0
+			boardedCount := 0
+			{
+				constPauseAlight := 300 * time.Millisecond
+				constPauseBoard := 300 * time.Millisecond
+				alighted := connBus.AlightPassengersAtCurrentStop(engine.Now)
+				if len(alighted) > 0 {
+					alightedCount = len(alighted)
+					flush("alight", map[string]any{"stop_id": stop.ID, "alighted": alightedCount, "bus_onboard": connBus.PassengersOnboard})
+					time.Sleep(constPauseAlight)
+					engine.Now = engine.Now.Add(constPauseAlight)
+				}
+				boarded := stop.BoardAtStop(connBus, engine.Now)
+				if len(boarded) > 0 {
+					boardedCount = len(boarded)
+					flush("board", map[string]any{"stop_id": stop.ID, "boarded": boardedCount, "bus_onboard": connBus.PassengersOnboard, "stop_queue": len(stop.OutboundQueue)})
+					time.Sleep(constPauseBoard)
+					engine.Now = engine.Now.Add(constPauseBoard)
+				}
+				flush("stop_update", map[string]any{"stop_id": stop.ID, "outbound_queue": len(stop.OutboundQueue)})
+				if idx == len(route.Stops)-1 { break }
+				baseDwell := 1500*time.Millisecond + time.Duration(boardedCount)*200*time.Millisecond
+				if baseDwell > 0 {
+					flush("dwell", map[string]any{"stop_id": stop.ID, "remaining_ms": baseDwell.Milliseconds()})
+					time.Sleep(baseDwell)
+					engineGenerateArrivals(engine, engine.Now, engine.Now.Add(baseDwell), idx+1, flush)
+					engine.Now = engine.Now.Add(baseDwell)
+				}
 			}
-			boarded := stop.BoardAtStop(connBus, engine.Now)
-			if len(boarded) > 0 {
-				flush("board", map[string]any{"stop_id": stop.ID, "boarded": len(boarded), "bus_onboard": connBus.PassengersOnboard, "stop_queue": len(stop.OutboundQueue)})
-				time.Sleep(pauseAfterBoard)
-				engine.Now = engine.Now.Add(pauseAfterBoard)
-				consumedPause += pauseAfterBoard
+			if idx == len(route.Stops)-1 {
+				// Final stop: force remaining onboard passengers to alight here.
+				connBus.CurrentStopID = stop.ID
+				alightedFinal := connBus.AlightPassengersAtCurrentStop(engine.Now)
+				if len(alightedFinal) > 0 {
+					flush("alight", map[string]any{"stop_id": stop.ID, "alighted": len(alightedFinal), "bus_onboard": connBus.PassengersOnboard, "final": true})
+				}
+				break
 			}
-			flush("stop_update", map[string]any{"stop_id": stop.ID, "outbound_queue": len(stop.OutboundQueue)})
-			if idx == len(route.Stops)-1 { break }
-			// dwell (remaining after any pauses above)
-			baseDwell := 2*time.Second + time.Duration(len(boarded))*250*time.Millisecond
-			remainingDwell := baseDwell - consumedPause
-			if remainingDwell < 0 { remainingDwell = 0 }
-			if remainingDwell > 0 {
-				flush("dwell", map[string]any{"stop_id": stop.ID, "remaining_ms": remainingDwell.Milliseconds()})
-				time.Sleep(remainingDwell)
-				engineGenerateArrivals(engine, engine.Now, engine.Now.Add(remainingDwell), idx+1, flush)
-				engine.Now = engine.Now.Add(remainingDwell)
-			}
-			// generate arrivals during consumed (handled incrementally above for pauses)
-			// travel
 			next := route.Stops[idx+1]
 			dist := stop.DistanceToNext
 			travelMin := dist / connBus.AverageSpeedKmph * 60
@@ -123,9 +128,9 @@ func main() {
 				lat := stop.Latitude + (next.Latitude-stop.Latitude)*t
 				lng := stop.Longitude + (next.Longitude-stop.Longitude)*t
 				flush("move", map[string]any{"lat": lat, "lng": lng, "t": t, "from": stop.ID, "to": next.ID})
-				time.Sleep(150 * time.Millisecond) // visual pacing
-				engineGenerateArrivals(engine, engine.Now, engine.Now.Add(150*time.Millisecond), idx+1, flush)
-				engine.Now = engine.Now.Add(150 * time.Millisecond)
+				time.Sleep(120 * time.Millisecond)
+				engineGenerateArrivals(engine, engine.Now, engine.Now.Add(120*time.Millisecond), idx+1, flush)
+				engine.Now = engine.Now.Add(120 * time.Millisecond)
 			}
 			connBus.CurrentStopID = next.ID
 		}

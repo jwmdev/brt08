@@ -51,7 +51,8 @@ async function init() {
         stop_name: s.stop_name ?? s.name,
         latitute: s.latitute,
         longtude: s.longtude,
-        distance_next_stop: s.distance_next_stop ?? s.distance_to_next ?? s.DistanceToNext ?? 0
+        distance_next_stop: s.distance_next_stop ?? s.distance_to_next ?? s.DistanceToNext ?? 0,
+        is_pin: s.is_pin === true
     }));
     // Provide route level fallbacks
     data.route = data.route || data.name || 'Route';
@@ -63,14 +64,83 @@ async function init() {
     });
     osm.addTo(map);
     // Fit map to stops bounds
-    const group = L.featureGroup(stops.map(createStopMarker));
+    const visibleStopMarkers = stops.filter(s => !s.is_pin).map(createStopMarker);
+    const group = L.featureGroup(visibleStopMarkers);
     group.addTo(map);
     map.fitBounds(group.getBounds().pad(0.15));
-    // Draw polyline
-    const polylineLatLngs = stops.map(s => [s.latitute, s.longtude]);
-    const routeLine = L.polyline(polylineLatLngs, { color: '#1976d2', weight: 4, opacity: 0.8 }).addTo(map);
+    // Catmull-Rom spline (centripetal variant simplified) that passes through original stop points.
+    function catmullRom(points, segmentsPerEdge = 16) {
+        if (points.length < 3)
+            return points;
+        const pts = [];
+        const clamp = (i) => {
+            if (i < 0)
+                return points[0];
+            if (i >= points.length)
+                return points[points.length - 1];
+            return points[i];
+        };
+        for (let i = 0; i < points.length - 1; i++) {
+            const P0 = clamp(i - 1);
+            const P1 = clamp(i);
+            const P2 = clamp(i + 1);
+            const P3 = clamp(i + 2);
+            // Include the actual stop point (except after first iteration will be added by previous segment end)
+            if (i === 0)
+                pts.push([P1[0], P1[1]]);
+            for (let s = 1; s <= segmentsPerEdge; s++) {
+                const t = s / segmentsPerEdge; // 0..1
+                const t2 = t * t;
+                const t3 = t2 * t;
+                const x = 0.5 * ((2 * P1[0]) + (-P0[0] + P2[0]) * t + (2 * P0[0] - 5 * P1[0] + 4 * P2[0] - P3[0]) * t2 + (-P0[0] + 3 * P1[0] - 3 * P2[0] + P3[0]) * t3);
+                const y = 0.5 * ((2 * P1[1]) + (-P0[1] + P2[1]) * t + (2 * P0[1] - 5 * P1[1] + 4 * P2[1] - P3[1]) * t2 + (-P0[1] + 3 * P1[1] - 3 * P2[1] + P3[1]) * t3);
+                if (Number.isFinite(x) && Number.isFinite(y)) {
+                    pts.push([x, y]);
+                }
+                else {
+                    // fallback to raw point if numeric issue
+                    pts.push([P2[0], P2[1]]);
+                }
+            }
+        }
+        // Guarantee last original point present
+        const last = points[points.length - 1];
+        const tail = pts[pts.length - 1];
+        if (!tail || tail[0] !== last[0] || tail[1] !== last[1])
+            pts.push(last);
+        return pts;
+    }
+    const rawPoints = stops.map(s => [s.latitute, s.longtude]); // includes pins for geometry
+    let polyPoints = rawPoints;
+    try {
+        // filter consecutive duplicates
+        const dedup = [];
+        for (const p of rawPoints) {
+            if (!dedup.length || dedup[dedup.length - 1][0] !== p[0] || dedup[dedup.length - 1][1] !== p[1])
+                dedup.push(p);
+        }
+        polyPoints = catmullRom(dedup, 14);
+        // Ensure all original stops are in the polyline sequence (for hit-testing / pass-through guarantee)
+        for (const orig of dedup) {
+            let contained = false;
+            for (const pp of polyPoints) {
+                if (Math.abs(pp[0] - orig[0]) < 1e-9 && Math.abs(pp[1] - orig[1]) < 1e-9) {
+                    contained = true;
+                    break;
+                }
+            }
+            if (!contained)
+                polyPoints.push(orig);
+        }
+    }
+    catch (e) {
+        console.warn('smoothing failed, using raw path', e);
+        polyPoints = rawPoints;
+    }
+    L.polyline(polyPoints, { color: '#1976d2', weight: 8, opacity: 0.9, lineJoin: 'round', lineCap: 'round' }).addTo(map);
     // Bus marker for live updates
-    const bus = L.marker([stops[0].latitute, stops[0].longtude], { icon: createBusIcon() }).addTo(map);
+    const firstNonPin = stops.find(s => !s.is_pin) || stops[0];
+    const bus = L.marker([firstNonPin.latitute, firstNonPin.longtude], { icon: createBusIcon() }).addTo(map);
     // Bus occupancy label (div icon hovering above the bus)
     let busCapacity = 0;
     let busOnboard = 0;
@@ -85,7 +155,7 @@ async function init() {
             color = '#ef6c00';
         else if (ratio >= 0.5)
             color = '#f9a825';
-        return `<div style=\"transform:translate(-50%, 48%);background:#fff;border:1px solid #111;padding:3px 8px;border-radius:6px;font-size:12px;line-height:1.05;font-family:monospace;font-weight:600;min-width:60px;text-align:center;box-shadow:0 1px 5px rgba(0,0,0,.45);\"><span style='color:${color};'>${occ}</span>/<span>${cap}</span></div>`;
+        return `<div style=\"transform:translate(-40%, 80%);background:#fff;border:1px solid #111;padding:3px 8px;border-radius:6px;font-size:12px;line-height:1.05;font-family:monospace;font-weight:600;min-width:30px;text-align:center;box-shadow:0 1px 5px rgba(0,0,0,.45);\"><span style='color:${color};'>${occ}</span>/<span>${cap}</span></div>`;
     };
     const busLabel = L.marker(bus.getLatLng(), { interactive: false, icon: L.divIcon({ className: 'bus-occupancy-label', html: makeBusLabelHTML() }) }).addTo(map);
     function refreshBusLabel() {
@@ -95,6 +165,8 @@ async function init() {
     // Add passenger count labels
     const stopLabels = {};
     stops.forEach(s => {
+        if (s.is_pin)
+            return; // skip labeling geometry-only pins
         const id = s.stop_id;
         const label = L.marker([s.latitute, s.longtude], {
             icon: L.divIcon({ className: 'stop-count-label', html: `<div data-stop="${id}" style="transform: translate(-50%, -135%); background:#fff; padding:4px 6px; border:1px solid #222; border-radius:6px; font-size:11px; font-family:monospace; min-width:70px; text-align:center; box-shadow:0 1px 4px rgba(0,0,0,.4);"><div style='font-weight:600; white-space:nowrap;'>${s.stop_name}</div><div class='count' data-stop-count='${id}' style='margin-top:2px; font-size:12px;'>0</div></div>` })
@@ -159,7 +231,7 @@ async function init() {
         es.addEventListener('arrive', ev => {
             try {
                 const d = JSON.parse(ev.data);
-                const st = stops.find(s => s.stop_id === d.stop_id);
+                const st = stops.find(s => s.stop_id === d.stop_id && !s.is_pin);
                 if (st) {
                     // subtle pulse effect on arrival
                     const el = document.querySelector(`div[data-stop='${st.stop_id}']`);
@@ -182,7 +254,9 @@ async function init() {
         es.addEventListener('stop_update', ev => {
             try {
                 const d = JSON.parse(ev.data);
-                updateStopCount(d.stop_id, d.outbound_queue);
+                const stp = stops.find(s => s.stop_id === d.stop_id && !s.is_pin);
+                if (stp)
+                    updateStopCount(d.stop_id, d.outbound_queue);
             }
             catch { }
         });

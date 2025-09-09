@@ -8,6 +8,15 @@ type Route struct {
     TotalDistanceKM float64    `json:"total_distance_km"`
     UnitDistance    string     `json:"unit_distance"`
     Stops           []*BusStop `json:"stops"`
+    Pins            []*RoutePin `json:"pins,omitempty"`
+}
+
+// RoutePin is an intermediate geometry point between two stops.
+type RoutePin struct {
+    LeftStopID  int     `json:"left_stop_id"`
+    RightStopID int     `json:"right_stop_id"`
+    Latitude    float64 `json:"latitute"`
+    Longitude   float64 `json:"longtude"`
 }
 
 // GetStop returns the stop by id.

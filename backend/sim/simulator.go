@@ -96,8 +96,14 @@ func (s *Simulator) RunOnce() {
 		ssCurr.RemainingOutbound = len(stop.OutboundQueue)
 		ssCurr.RemainingInbound = len(stop.InboundQueue)
 
-		// If last stop, finish
-		if idx == len(s.Route.Stops)-1 { break }
+		// If last stop, force alight any remaining passengers and finish
+		if idx == len(s.Route.Stops)-1 {
+			if len(s.Bus.Passengers) > 0 {
+				alighted := s.Bus.AlightPassengersAtCurrentStop(s.Now)
+				if len(alighted) > 0 { for _, p := range alighted { s.Completed = append(s.Completed, p) } }
+			}
+			break
+		}
 
 		// Determine departure (with simple dwell formula)
 		dwellSeconds := 15 + 2*len(boarded) + 1*len(alighted)
@@ -151,11 +157,21 @@ func (s *Simulator) generateArrivals(start, end time.Time, fromIndex int) {
 
 func (s *Simulator) newPassenger(origin, dest int, arrival time.Time) *model.Passenger {
 	s.PassengerID++
+	// Determine direction by index positions (simplistic: origin index < dest index => outbound)
+	dir := "outbound"
+	originIdx := -1
+	destIdx := -1
+	for i, st := range s.Route.Stops {
+		if st.ID == origin { originIdx = i }
+		if st.ID == dest { destIdx = i }
+	}
+	if originIdx >=0 && destIdx >=0 && destIdx < originIdx { dir = "inbound" }
 	return &model.Passenger{
-		ID:           s.PassengerID,
-		RouteID:      s.Route.ID,
-		StartStopID:  origin,
-		EndStopID:    dest,
+		ID:             s.PassengerID,
+		RouteID:        s.Route.ID,
+		StartStopID:    origin,
+		EndStopID:      dest,
+		Direction:      dir,
 		ArrivalStopTime: arrival,
 	}
 }
