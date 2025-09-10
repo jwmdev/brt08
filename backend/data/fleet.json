@@ -1,0 +1,10 @@
+{
+	"bus_types": [
+		{ "id": 1, "name": "Standard 12m", "capacity": 70, "cost_per_km": 4550 }, 
+		{ "id": 2, "name": "Articulated 18m", "capacity": 140, "cost_per_km": 7280 } 
+	],
+	"fleet": [
+		{ "type_id": 1, "quantity": 4 },
+		{ "type_id": 2, "quantity": 3 }
+	]
+}

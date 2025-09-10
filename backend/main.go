@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"sync"
 	"time"
+	"math/rand"
 	"brt08/backend/model"
 	"brt08/backend/sim"
 	"brt08/backend/data"
@@ -34,10 +35,30 @@ func main() {
 		panic(err)
 	}
 
-	bt := &model.BusType{ID: 1, Name: "Standard 12m", Capacity: 70, CostPerKm: 1.75}
-	// Template buses (one per direction)
-	busOutbound := &model.Bus{ID: 1, Type: bt, RouteID: route.ID, CurrentStopID: route.Stops[0].ID, Direction: "outbound", AverageSpeedKmph: 28.0}
-	busInbound := &model.Bus{ID: 2, Type: bt, RouteID: route.ID, CurrentStopID: route.Stops[len(route.Stops)-1].ID, Direction: "inbound", AverageSpeedKmph: 28.0}
+	// Load fleet configuration
+	fleetFile, err := os.Open("data/fleet.json")
+	if err != nil { log.Printf("warning: open fleet.json failed: %v; falling back to two default buses", err) }
+	var fleetBuses []*model.Bus
+	if err == nil {
+		defer fleetFile.Close()
+		types, qty, ferr := model.LoadFleetFromReader(fleetFile)
+		if ferr != nil {
+			log.Printf("warning: parse fleet.json failed: %v; using defaults", ferr)
+		} else {
+			rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+			first := route.Stops[0].ID
+			last := route.Stops[len(route.Stops)-1].ID
+			fleetBuses = model.BuildFleetBuses(types, qty, route.ID, first, last, rng)
+		}
+	}
+	if len(fleetBuses) == 0 {
+		// Fallback to two template buses (one per direction)
+		bt := &model.BusType{ID: 1, Name: "Standard 12m", Capacity: 70, CostPerKm: 1.75}
+		fleetBuses = []*model.Bus{
+			{ID: 1, Type: bt, RouteID: route.ID, CurrentStopID: route.Stops[0].ID, Direction: "outbound", AverageSpeedKmph: 28.0},
+			{ID: 2, Type: bt, RouteID: route.ID, CurrentStopID: route.Stops[len(route.Stops)-1].ID, Direction: "inbound", AverageSpeedKmph: 28.0},
+		}
+	}
 
 	http.HandleFunc("/api/route", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -54,13 +75,27 @@ func main() {
 		flusher, ok := w.(http.Flusher)
 		if !ok { http.Error(w, "stream unsupported", 500); return }
 
-			// Per-connection bus clones
-			outBus := &model.Bus{ID: busOutbound.ID, Type: busOutbound.Type, RouteID: route.ID, CurrentStopID: route.Stops[0].ID, Direction: "outbound", AverageSpeedKmph: busOutbound.AverageSpeedKmph}
-			inBus := &model.Bus{ID: busInbound.ID, Type: busInbound.Type, RouteID: route.ID, CurrentStopID: route.Stops[len(route.Stops)-1].ID, Direction: "inbound", AverageSpeedKmph: busInbound.AverageSpeedKmph}
+			// Per-connection bus clones based on fleet
+			// We'll instantiate but start them with staggered activation
+			baseRNG := rand.New(rand.NewSource(time.Now().UnixNano()))
+			connBuses := make([]*model.Bus, 0, len(fleetBuses))
+			for _, proto := range fleetBuses {
+				// Deep-ish clone
+				b := &model.Bus{ID: proto.ID, Type: proto.Type, RouteID: proto.RouteID, CurrentStopID: proto.CurrentStopID, Direction: proto.Direction, AverageSpeedKmph: proto.AverageSpeedKmph}
+				connBuses = append(connBuses, b)
+			}
 			start := time.Now()
 			lambda := 1.2
 			if qs := r.URL.Query().Get("lambda"); qs != "" { if v, err := strconv.ParseFloat(qs, 64); err == nil && v > 0 { lambda = v } }
-			engine := sim.NewSimulator(route, outBus, time.Now().UnixNano(), lambda, start)
+			// Use the first bus (or a default) for engine construction; engine.Bus is mostly unused for multi-bus stream logic
+			var dummy *model.Bus
+			if len(connBuses) > 0 {
+				dummy = &model.Bus{ID: 0, Type: connBuses[0].Type, RouteID: route.ID, CurrentStopID: connBuses[0].CurrentStopID, Direction: connBuses[0].Direction, AverageSpeedKmph: connBuses[0].AverageSpeedKmph}
+			} else {
+				bt := &model.BusType{ID: 1, Name: "Standard", Capacity: 60, CostPerKm: 0}
+				dummy = &model.Bus{ID: 0, Type: bt, RouteID: route.ID, CurrentStopID: route.Stops[0].ID, Direction: "outbound", AverageSpeedKmph: 28}
+			}
+			engine := sim.NewSimulator(route, dummy, time.Now().UnixNano(), lambda, start)
 			engine.PeriodID = *periodID
 			engine.TotalPassengerCap = *passengerCap
 			engine.MorningTowardKivukoni = *morningTowardKivukoni
@@ -81,6 +116,8 @@ func main() {
 		var cumServed int64 = 0
 		var waitSumMin float64 = 0
 		var waitCount int64 = 0
+		// Per-bus distance (km)
+		busDistance := make(map[int]float64)
 
 		// Shared lock for stop queues and time
 		var mu sync.Mutex
@@ -93,7 +130,7 @@ func main() {
 			mu.Lock()
 			defer mu.Unlock()
 			if engine.GeneratedPassengers < *passengerCap { return false }
-			if outBus.PassengersOnboard > 0 || inBus.PassengersOnboard > 0 { return false }
+			for _, b := range connBuses { if b.PassengersOnboard > 0 { return false } }
 			for _, s := range route.Stops {
 				if len(s.OutboundQueue) > 0 || len(s.InboundQueue) > 0 { return false }
 			}
@@ -262,12 +299,10 @@ func main() {
 				}
 
 			engine.Now = start
-			flush("init", map[string]any{"time": engine.Now, "buses": []any{outBus, inBus}, "message": "started", "generated_passengers": engine.GeneratedPassengers, "outbound_generated": engine.OutboundGenerated, "inbound_generated": engine.InboundGenerated, "served_passengers": cumServed, "avg_wait_min": 0.0})
-			flush("move", map[string]any{"bus_id": outBus.ID, "direction": outBus.Direction, "lat": route.Stops[0].Latitude, "lng": route.Stops[0].Longitude, "from": 0, "to": route.Stops[0].ID, "t": 0})
-			flush("move", map[string]any{"bus_id": inBus.ID, "direction": inBus.Direction, "lat": route.Stops[len(route.Stops)-1].Latitude, "lng": route.Stops[len(route.Stops)-1].Longitude, "from": 0, "to": route.Stops[len(route.Stops)-1].ID, "t": 0})
+			// Do not pre-place all buses; they will appear over time via bus_add events
+			flush("init", map[string]any{"time": engine.Now, "buses": []any{}, "message": "started", "generated_passengers": engine.GeneratedPassengers, "outbound_generated": engine.OutboundGenerated, "inbound_generated": engine.InboundGenerated, "served_passengers": cumServed, "avg_wait_min": 0.0})
 
 			var wg sync.WaitGroup
-			wg.Add(2)
 
 			simulate := func(bus *model.Bus, forward bool) {
 				defer wg.Done()
@@ -328,7 +363,7 @@ func main() {
 								for _, p := range boarded { if p.WaitDuration != nil { sum += *p.WaitDuration } }
 								avgWait = sum / float64(len(boarded))
 							}
-							log.Printf("STOP %d %s | alight=%d board=%d onboard=%d dwell=%v avg_wait=%.2fmin\n", stop.ID, stop.Name, len(alighted), len(boarded), bus.PassengersOnboard, dwell, avgWait)
+							log.Printf("Bus %d (%s) STOP %d %s | alight=%d board=%d onboard=%d dwell=%v avg_wait=%.2fmin", bus.ID, bus.Direction, stop.ID, stop.Name, len(alighted), len(boarded), bus.PassengersOnboard, dwell, avgWait)
 							flush("dwell", map[string]any{"bus_id": bus.ID, "direction": bus.Direction, "stop_id": stop.ID, "alighted": len(alighted), "boarded": len(boarded), "bus_onboard": bus.PassengersOnboard, "dwell_ms": dwell.Milliseconds(), "generated_passengers": engine.GeneratedPassengers, "outbound_generated": engine.OutboundGenerated, "inbound_generated": engine.InboundGenerated})
 							time.Sleep(dwell)
 							// advance simulation time by dwell duration
@@ -355,6 +390,10 @@ func main() {
 							mu.Unlock()
 							select { case <-stopCh: return; default: }
 						}
+						// accumulate segment distance
+						mu.Lock()
+						busDistance[bus.ID] += dist
+						mu.Unlock()
 						bus.CurrentStopID = next.ID
 					}
 					// final alight at terminal, then turnaround after a short dwell
@@ -409,7 +448,7 @@ func main() {
 								for _, p := range boarded { if p.WaitDuration != nil { sum2 += *p.WaitDuration } }
 								avgWait2 = sum2 / float64(len(boarded))
 							}
-							log.Printf("STOP %d %s | alight=%d board=%d onboard=%d dwell=%v avg_wait=%.2fmin\n", stop.ID, stop.Name, len(alighted), len(boarded), bus.PassengersOnboard, dwell, avgWait2)
+							log.Printf("Bus %d (%s) STOP %d %s | alight=%d board=%d onboard=%d dwell=%v avg_wait=%.2fmin", bus.ID, bus.Direction, stop.ID, stop.Name, len(alighted), len(boarded), bus.PassengersOnboard, dwell, avgWait2)
 							flush("dwell", map[string]any{"bus_id": bus.ID, "direction": bus.Direction, "stop_id": stop.ID, "alighted": len(alighted), "boarded": len(boarded), "bus_onboard": bus.PassengersOnboard, "dwell_ms": dwell.Milliseconds(), "generated_passengers": engine.GeneratedPassengers, "outbound_generated": engine.OutboundGenerated, "inbound_generated": engine.InboundGenerated})
 							time.Sleep(dwell)
 							mu.Lock()
@@ -435,6 +474,10 @@ func main() {
 							mu.Unlock()
 							select { case <-stopCh: return; default: }
 						}
+						// accumulate segment distance (reverse uses prev.DistanceToNext)
+						mu.Lock()
+						busDistance[bus.ID] += dist
+						mu.Unlock()
 						bus.CurrentStopID = prev.ID
 					}
 					// final alight at terminal, then turnaround
@@ -453,8 +496,88 @@ func main() {
 				} // end for ping-pong
 			}
 
-			go simulate(outBus, true)
-			go simulate(inBus, false)
+			// Choose initial direction for each bus using direction bias
+			favoredOutbound = (engine.PeriodID == 2 && *morningTowardKivukoni) || (engine.PeriodID == 5 && !*morningTowardKivukoni)
+			favoredInbound = (engine.PeriodID == 2 && !*morningTowardKivukoni) || (engine.PeriodID == 5 && *morningTowardKivukoni)
+			pOutbound := 0.5
+			if favoredOutbound { pOutbound = engine.DirectionBiasFactor / (engine.DirectionBiasFactor + 1.0) } else if favoredInbound { pOutbound = 1.0 / (engine.DirectionBiasFactor + 1.0) }
+			// Assign
+			for _, b := range connBuses {
+				if baseRNG.Float64() <= pOutbound {
+					b.Direction = "outbound"
+					b.CurrentStopID = route.Stops[0].ID
+				} else {
+					b.Direction = "inbound"
+					b.CurrentStopID = route.Stops[len(route.Stops)-1].ID
+				}
+			}
+			// Compute simulation-time headway per direction and map to real-time activation offsets
+			// Estimate trip time using average speed per direction. Then set headway ≈ tripTime / nDir
+			busesOutbound := make([]*model.Bus, 0)
+			busesInbound := make([]*model.Bus, 0)
+			for _, b := range connBuses { if b.Direction == "inbound" { busesInbound = append(busesInbound, b) } else { busesOutbound = append(busesOutbound, b) } }
+
+			routeDistance := route.TotalDistanceKM
+			if routeDistance <= 0 {
+				// fallback: sum DistanceToNext
+				sum := 0.0
+				for _, s := range route.Stops { sum += s.DistanceToNext }
+				if sum > 0 { routeDistance = sum }
+			}
+			// mapping from sim time to real time; travel runs ~0.15x real per sim sec; dwell 1x. Use a blended factor leaning toward travel dominance.
+			simSecToReal := 0.2 // 1 sim sec ≈ 0.2 real sec => 1 sim min ≈ 12s real
+			simMinToReal := simSecToReal * float64(time.Second) * 60.0
+
+			makeSchedule := func(list []*model.Bus) []struct{ bus *model.Bus; delay time.Duration } {
+				n := len(list)
+				if n == 0 { return nil }
+				// average speed among these buses
+				var avgV float64
+				for _, b := range list { avgV += b.AverageSpeedKmph }
+				avgV /= float64(n)
+				if avgV <= 0 { avgV = 25 }
+				tripMin := routeDistance / avgV * 60.0
+				headwayMin := tripMin / float64(n)
+				if headwayMin < 0.5 { headwayMin = 0.5 }
+				if headwayMin > 15 { headwayMin = 15 }
+				sched := make([]struct{ bus *model.Bus; delay time.Duration }, 0, n)
+				for i, b := range list {
+					base := float64(i) * headwayMin
+					// jitter ±20%
+					jitter := (baseRNG.Float64()*0.4 - 0.2) * headwayMin
+					simOffsetMin := base + jitter
+					if simOffsetMin < 0 { simOffsetMin = 0 }
+					realDelay := time.Duration(simOffsetMin * simMinToReal)
+					sched = append(sched, struct{ bus *model.Bus; delay time.Duration }{bus: b, delay: realDelay})
+				}
+				return sched
+			}
+
+			schedule := append(makeSchedule(busesOutbound), makeSchedule(busesInbound)...)
+			// Launch buses according to schedule
+			for _, item := range schedule {
+				bus := item.bus
+				forward := bus.Direction == "outbound"
+				wg.Add(1)
+				go func(bu *model.Bus, fwd bool, d time.Duration) {
+					time.Sleep(d)
+					// notify frontend and place at starting terminal
+					cap := 0
+					if bu.Type != nil { cap = bu.Type.Capacity }
+					flush("bus_add", map[string]any{"bus_id": bu.ID, "direction": bu.Direction, "avg_speed_kmph": bu.AverageSpeedKmph, "capacity": cap})
+					log.Printf("Bus %d added to route (%s), avg_speed=%.1f km/h", bu.ID, bu.Direction, bu.AverageSpeedKmph)
+					var lat, lng float64
+					if bu.Direction == "inbound" {
+						lat = route.Stops[len(route.Stops)-1].Latitude
+						lng = route.Stops[len(route.Stops)-1].Longitude
+					} else {
+						lat = route.Stops[0].Latitude
+						lng = route.Stops[0].Longitude
+					}
+					flush("move", map[string]any{"bus_id": bu.ID, "direction": bu.Direction, "lat": lat, "lng": lng, "from": 0, "to": bu.CurrentStopID, "t": 0})
+					simulate(bu, fwd)
+				}(bus, forward, item.delay)
+			}
 
 			// Wait for simulate goroutines to finish (stopCh closed), then ensure generator finished
 			wg.Wait()
@@ -462,28 +585,31 @@ func main() {
 			avgFinal := 0.0
 			if waitCount > 0 { avgFinal = waitSumMin / float64(waitCount) }
 			flush("done", map[string]any{"completed": true, "generated_passengers": engine.GeneratedPassengers, "outbound_generated": engine.OutboundGenerated, "inbound_generated": engine.InboundGenerated, "served_passengers": cumServed, "avg_wait_min": avgFinal})
+			// Final console report
+			// Compute costs per bus
+			totalCost := 0.0
+			totalDist := 0.0
+			log.Println("=== Simulation Report ===")
+			log.Printf("Buses on route: %d", len(connBuses))
+			log.Printf("Passengers generated: %d", engine.GeneratedPassengers)
+			log.Printf("Passengers served: %d", cumServed)
+			log.Printf("Average wait: %.2f minutes", avgFinal)
+			for _, b := range connBuses {
+				d := busDistance[b.ID]
+				c := 0.0
+				if b.Type != nil { c = float64(b.Type.CostPerKm) * d }
+				totalDist += d
+				totalCost += c
+				name := ""
+				if b.Type != nil { name = b.Type.Name }
+				log.Printf("Bus %d (%s, %s) distance=%.2f km cost=%.2f", b.ID, b.Direction, name, d, c)
+			}
+			log.Printf("Total distance: %.2f km", totalDist)
+			log.Printf("Total operating cost: %.2f", totalCost)
 	})
 
 	log.Println("Serving on :8080")
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
 
-// engineGenerateArrivals adds new passengers to downstream stops during an interval and flushes stop updates.
-func engineGenerateArrivals(engine *sim.Simulator, start, end time.Time, fromIndex int, flush func(string, any)) {
-	durMinutes := end.Sub(start).Minutes()
-	if durMinutes <= 0 { return }
-	for i := fromIndex; i < len(engine.Route.Stops)-1; i++ { // exclude last stop
-		stop := engine.Route.Stops[i]
-		mean := engine.LambdaPerMinute * durMinutes
-		cnt := engine.PoissonPublic(mean)
-		if cnt == 0 { continue }
-		for j := 0; j < cnt; j++ {
-			destIdx := i + 1 + engine.RNG.Intn(len(engine.Route.Stops)-i-1)
-			dest := engine.Route.Stops[destIdx]
-			t := start.Add(time.Duration(engine.RNG.Float64()*durMinutes*float64(time.Minute)))
-			p := engine.NewPassengerPublic(stop.ID, dest.ID, t)
-			stop.EnqueuePassenger(p, "outbound", t)
-		}
-		flush("stop_update", map[string]any{"stop_id": stop.ID, "outbound_queue": len(stop.OutboundQueue)})
-	}
-}
+// (helper removed; generation moved into stream loop)

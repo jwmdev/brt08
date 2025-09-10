@@ -245,7 +245,7 @@ async function init() {
     el.innerHTML = `<div style='font-weight:600;margin-bottom:4px;min-width:150px;'>${data.route}</div>`+
       `<div style='margin-bottom:4px;'>${legendState}</div>`+
       `<div>Passengers generated: <strong>${totals.total}</strong></div>`+
-      `<div>Passengers served (alighted): <strong>${totals.served}</strong></div>`+
+      `<div>Passengers served: <strong>${totals.served}</strong></div>`+
       `<div>Avg wait: <strong>${totals.avgWaitMin.toFixed(2)} min</strong></div>`+
       `<div style='margin-top:2px;'>`+
       `<span style='color:#1976d2;font-weight:600;'>Outbound: ${totals.outbound}</span><br/>`+
@@ -294,7 +294,7 @@ async function init() {
               // initial position: first stop for outbound, last stop for inbound
               let lat = stops[0].latitute, lng = stops[0].longtude;
               if (dir === 'inbound') { lat = stops[stops.length-1].latitute; lng = stops[stops.length-1].longtude; }
-              buses[id] = createBusState(id, dir, lat, lng, cap, onboard);
+              if (!buses[id]) buses[id] = createBusState(id, dir, lat, lng, cap, onboard);
             });
           }
           if (typeof d.generated_passengers === 'number') {
@@ -304,6 +304,20 @@ async function init() {
             if (typeof d.served_passengers === 'number') totals.served = d.served_passengers;
             if (typeof d.avg_wait_min === 'number') totals.avgWaitMin = d.avg_wait_min;
             renderLegend('Simulation started');
+          }
+        } catch {}
+      });
+      // New bus added later (staggered activation)
+      es.addEventListener('bus_add', ev => {
+        try {
+          const d = JSON.parse((ev as MessageEvent).data);
+          const id = d.bus_id;
+          const dir = d.direction ?? 'outbound';
+          if (typeof id === 'number' && !buses[id]) {
+            let lat = stops[0].latitute, lng = stops[0].longtude;
+            if (dir === 'inbound') { lat = stops[stops.length-1].latitute; lng = stops[stops.length-1].longtude; }
+            const cap = typeof d.capacity === 'number' ? d.capacity : 0;
+            buses[id] = createBusState(id, dir, lat, lng, cap, 0);
           }
         } catch {}
       });
