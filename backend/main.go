@@ -21,6 +21,7 @@ import (
 // per-connection control state
 type connControl struct {
     speed atomic.Value // stores float64
+	arrivalMult atomic.Value // stores float64 multiplier for arrival rate
 }
 
 var streamControls sync.Map // map[string]*connControl
@@ -34,6 +35,7 @@ func main() {
 	baselineDemand := flag.Float64("baseline_demand", 0.3, "baseline fraction of demand when gradient applies (0-1)")
 	reportPath := flag.String("report", "", "if set, write a CSV report to this file or directory (timestamp appended)")
 	defaultSpeed := flag.Float64("time_scale", 1.0, "simulation real-time speed multiplier (>1 = faster)")
+	defaultArrFactor := flag.Float64("arrival_factor", 1.0, "multiplier for passenger arrival rate (>1 = faster arrivals)")
 	flag.Parse()
 	// Load route file
 	f, err := os.Open("data/kimara_kivukoni_stops.json")
@@ -78,22 +80,31 @@ func main() {
 		w.Write(j)
 	})
 
-	// control endpoint: adjust speed of an active stream connection without restarting
+	// control endpoint: adjust speed/arrival rate of an active stream connection without restarting
 	http.HandleFunc("/api/control", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 		if r.Method == http.MethodOptions { w.WriteHeader(204); return }
 		if r.Method != http.MethodPost { http.Error(w, "method not allowed", http.StatusMethodNotAllowed); return }
-		var req struct { ConnID string `json:"conn_id"`; Speed float64 `json:"speed"` }
+		var req struct { ConnID string `json:"conn_id"`; Speed float64 `json:"speed"`; ArrivalFactor float64 `json:"arrival_factor"` }
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil { http.Error(w, "bad json", 400); return }
 		v, ok := streamControls.Load(req.ConnID)
 		if !ok { http.Error(w, "connection not found", 404); return }
-		sp := req.Speed
-		if sp <= 0 { sp = 1 }
-		if sp < 0.1 { sp = 0.1 }
-		if sp > 10.0 { sp = 10.0 }
 		c := v.(*connControl)
-		c.speed.Store(sp)
+		if req.Speed != 0 {
+			sp := req.Speed
+			if sp <= 0 { sp = 1 }
+			if sp < 0.1 { sp = 0.1 }
+			if sp > 10.0 { sp = 10.0 }
+			c.speed.Store(sp)
+		}
+		if req.ArrivalFactor != 0 {
+			af := req.ArrivalFactor
+			if af <= 0 { af = 1 }
+			if af < 0.1 { af = 0.1 }
+			if af > 50.0 { af = 50.0 }
+			c.arrivalMult.Store(af)
+		}
 		w.WriteHeader(204)
 	})
 
@@ -128,6 +139,14 @@ func main() {
 			if initSpeed < 0.1 { initSpeed = 0.1 }
 			if initSpeed > 10.0 { initSpeed = 10.0 }
 			ctrl.speed.Store(initSpeed)
+			// initial arrival factor from query or default
+			initArr := *defaultArrFactor
+			if qs := r.URL.Query().Get("arrival_factor"); qs != "" {
+				if v, err := strconv.ParseFloat(qs, 64); err == nil && v > 0 { initArr = v }
+			}
+			if initArr < 0.1 { initArr = 0.1 }
+			if initArr > 50.0 { initArr = 50.0 }
+			ctrl.arrivalMult.Store(initArr)
 			streamControls.Store(connID, ctrl)
 			defer streamControls.Delete(connID)
 			// Use the first bus (or a default) for engine construction; engine.Bus is mostly unused for multi-bus stream logic
@@ -159,6 +178,21 @@ func main() {
 		var cumServed int64 = 0
 		var waitSumMin float64 = 0
 		var waitCount int64 = 0
+
+		// Consistent mapping from simulation time to real time; baseline 1 sim sec = 0.2 real sec at speed=1
+		simSecToReal := 0.2
+		// Wait for a duration of SIMULATION time, converting to real time using current speed.
+		waitSim := func(simDur time.Duration) {
+			remaining := simDur
+			for remaining > 0 {
+				chunk := remaining
+				if chunk > 500*time.Millisecond { chunk = 500 * time.Millisecond }
+				cur := ctrl.speed.Load().(float64); if cur <= 0 { cur = 1 }
+				realSleep := time.Duration(float64(chunk) * simSecToReal / cur)
+				time.Sleep(realSleep)
+				remaining -= chunk
+			}
+		}
 		// Per-bus distance (km)
 		busDistance := make(map[int]float64)
 
@@ -290,53 +324,72 @@ func main() {
 					genWg.Add(1)
 					go func() {
 						defer genWg.Done()
+						// Interpret lambda as arrivals per corridor per minute (scaled by period multiplier)
+						simStep := 1 * time.Second // simulation time step per batch
 						for {
 							if totalTarget > 0 && engine.GeneratedPassengers >= totalTarget { return }
-							// sleep random 200-800ms to stagger arrivals using current speed
-							cur := ctrl.speed.Load().(float64)
-							if cur <= 0 { cur = 1 }
-							time.Sleep(time.Duration(float64(time.Duration(200+engine.RNG.Intn(600))*time.Millisecond) / cur))
+							// Sleep for one simulation step in real time, respecting current speed
+							waitSim(simStep)
 							mu.Lock()
 							// Re-check inside lock
 							if totalTarget > 0 && engine.GeneratedPassengers >= totalTarget { mu.Unlock(); return }
-							dir := "outbound"
-							pOutbound := 0.5
-							if favoredOutbound { pOutbound = engine.DirectionBiasFactor / (engine.DirectionBiasFactor + 1.0) } else if favoredInbound { pOutbound = 1.0 / (engine.DirectionBiasFactor + 1.0) }
-							if engine.RNG.Float64() >= pOutbound { dir = "inbound" }
-							if dir == "outbound" {
-								weights := make([]float64, len(route.Stops)-1)
-								sum := 0.0
-								for i := 0; i < len(route.Stops)-1; i++ { w := gradientWeightOutbound(i); weights[i] = w; sum += w }
-								r := engine.RNG.Float64()*sum
-								cum := 0.0
-								originIdx := 0
-								for i, w := range weights { cum += w; if r <= cum { originIdx = i; break } }
-								destIdx := originIdx + 1 + engine.RNG.Intn(len(route.Stops)-originIdx-1)
-								origin := route.Stops[originIdx]
-								dest := route.Stops[destIdx]
-								arrTime := engine.Now // simulation time snapshot
-								p := engine.NewPassengerPublic(origin.ID, dest.ID, arrTime)
-								p.Direction = "outbound"
-								origin.EnqueuePassenger(p, "outbound", arrTime)
-								engine.GeneratedPassengers++; engine.OutboundGenerated++
-								flush("stop_update", map[string]any{"stop_id": origin.ID, "outbound_queue": len(origin.OutboundQueue), "inbound_queue": len(origin.InboundQueue), "generated_passengers": engine.GeneratedPassengers, "outbound_generated": engine.OutboundGenerated, "inbound_generated": engine.InboundGenerated})
-							} else {
-								weights := make([]float64, len(route.Stops)-1)
-								sum := 0.0
-								for i := 1; i < len(route.Stops); i++ { w := gradientWeightInbound(i); weights[i-1] = w; sum += w }
-								r := engine.RNG.Float64()*sum
-								cum := 0.0
-								originIdxGlobal := 1
-								for k, w := range weights { cum += w; if r <= cum { originIdxGlobal = k+1; break } }
-								destIdx := engine.RNG.Intn(originIdxGlobal)
-								origin := route.Stops[originIdxGlobal]
-								dest := route.Stops[destIdx]
-								arrTime := engine.Now
-								p := engine.NewPassengerPublic(origin.ID, dest.ID, arrTime)
-								p.Direction = "inbound"
-								origin.EnqueuePassenger(p, "inbound", arrTime)
-								engine.GeneratedPassengers++; engine.InboundGenerated++
-								flush("stop_update", map[string]any{"stop_id": origin.ID, "outbound_queue": len(origin.OutboundQueue), "inbound_queue": len(origin.InboundQueue), "generated_passengers": engine.GeneratedPassengers, "outbound_generated": engine.OutboundGenerated, "inbound_generated": engine.InboundGenerated})
+							// Expected arrivals this step with live arrival multiplier
+							stepMin := simStep.Minutes()
+							arrMult := 1.0
+							if v := ctrl.arrivalMult.Load(); v != nil { arrMult = v.(float64) }
+							mean := lambda * float64(mult) * stepMin * arrMult
+							count := engine.PoissonPublic(mean)
+							if count > 0 {
+								// Directional bias probability
+								pOutbound := 0.5
+								if favoredOutbound { pOutbound = engine.DirectionBiasFactor / (engine.DirectionBiasFactor + 1.0) } else if favoredInbound { pOutbound = 1.0 / (engine.DirectionBiasFactor + 1.0) }
+								updatedStops := make(map[int]struct{})
+								for i := 0; i < count; i++ {
+									dir := "outbound"
+									if engine.RNG.Float64() >= pOutbound { dir = "inbound" }
+									if dir == "outbound" {
+										weights := make([]float64, len(route.Stops)-1)
+										sum := 0.0
+										for si := 0; si < len(route.Stops)-1; si++ { w := gradientWeightOutbound(si); weights[si] = w; sum += w }
+										r := engine.RNG.Float64()*sum
+										cum := 0.0
+										originIdx := 0
+										for si, w := range weights { cum += w; if r <= cum { originIdx = si; break } }
+										destIdx := originIdx + 1 + engine.RNG.Intn(len(route.Stops)-originIdx-1)
+										origin := route.Stops[originIdx]
+										dest := route.Stops[destIdx]
+										arrTime := engine.Now
+										p := engine.NewPassengerPublic(origin.ID, dest.ID, arrTime)
+										p.Direction = "outbound"
+										origin.EnqueuePassenger(p, "outbound", arrTime)
+										engine.GeneratedPassengers++; engine.OutboundGenerated++
+										updatedStops[origin.ID] = struct{}{}
+									} else {
+										weights := make([]float64, len(route.Stops)-1)
+										sum := 0.0
+										for si := 1; si < len(route.Stops); si++ { w := gradientWeightInbound(si); weights[si-1] = w; sum += w }
+										r := engine.RNG.Float64()*sum
+										cum := 0.0
+										originIdxGlobal := 1
+										for k, w := range weights { cum += w; if r <= cum { originIdxGlobal = k+1; break } }
+										destIdx := engine.RNG.Intn(originIdxGlobal)
+										origin := route.Stops[originIdxGlobal]
+										dest := route.Stops[destIdx]
+										arrTime := engine.Now
+										p := engine.NewPassengerPublic(origin.ID, dest.ID, arrTime)
+										p.Direction = "inbound"
+										origin.EnqueuePassenger(p, "inbound", arrTime)
+										engine.GeneratedPassengers++; engine.InboundGenerated++
+										updatedStops[origin.ID] = struct{}{}
+									}
+								}
+								// Flush one stop_update per touched stop to limit chatter
+								for sid := range updatedStops {
+									st := route.GetStop(sid)
+									if st != nil {
+										flush("stop_update", map[string]any{"stop_id": sid, "outbound_queue": len(st.OutboundQueue), "inbound_queue": len(st.InboundQueue), "generated_passengers": engine.GeneratedPassengers, "outbound_generated": engine.OutboundGenerated, "inbound_generated": engine.InboundGenerated})
+									}
+								}
 							}
 							mu.Unlock()
 						}
@@ -345,14 +398,12 @@ func main() {
 
 			engine.Now = start
 			// Do not pre-place all buses; they will appear over time via bus_add events
-			flush("init", map[string]any{"time": engine.Now, "buses": []any{}, "message": "started", "conn_id": connID, "generated_passengers": engine.GeneratedPassengers, "outbound_generated": engine.OutboundGenerated, "inbound_generated": engine.InboundGenerated, "served_passengers": cumServed, "avg_wait_min": 0.0})
+			flush("init", map[string]any{"time": engine.Now, "buses": []any{}, "message": "started", "conn_id": connID, "generated_passengers": engine.GeneratedPassengers, "outbound_generated": engine.OutboundGenerated, "inbound_generated": engine.InboundGenerated, "served_passengers": cumServed, "avg_wait_min": 0.0, "arrival_factor": ctrl.arrivalMult.Load().(float64)})
 
 			var wg sync.WaitGroup
 
 			simulate := func(bus *model.Bus, forward bool) {
 				defer wg.Done()
-				// reusable holder for current speed scale
-				var cur float64
 					computeDwell := func(boardedN, alightedN int) time.Duration {
 						// Base dwell plus small increment per passenger, capped.
 						base := 1200 * time.Millisecond
@@ -380,9 +431,8 @@ func main() {
 								flush("alight", map[string]any{"bus_id": bus.ID, "direction": bus.Direction, "stop_id": stop.ID, "alighted": len(alighted), "bus_onboard": bus.PassengersOnboard, "passengers_onboard": bus.PassengersOnboard, "generated_passengers": engine.GeneratedPassengers, "outbound_generated": engine.OutboundGenerated, "inbound_generated": engine.InboundGenerated, "served_passengers": cumServed})
 							}
 						mu.Unlock()
-						// Small pause so onboard count visibly updates before boarding
-						cur := ctrl.speed.Load().(float64); if cur <= 0 { cur = 1 }
-						time.Sleep(time.Duration(float64(650*time.Millisecond) / cur))
+						// Small pause so onboard count visibly updates before boarding (simulation time)
+						waitSim(650 * time.Millisecond)
 						// advance simulation time by the pause duration
 						mu.Lock()
 						engine.Now = engine.Now.Add(650 * time.Millisecond)
@@ -413,8 +463,8 @@ func main() {
 							}
 							log.Printf("Bus %d (%s) STOP %d %s | alight=%d board=%d onboard=%d dwell=%v avg_wait=%.2fmin", bus.ID, bus.Direction, stop.ID, stop.Name, len(alighted), len(boarded), bus.PassengersOnboard, dwell, avgWait)
 							flush("dwell", map[string]any{"bus_id": bus.ID, "direction": bus.Direction, "stop_id": stop.ID, "alighted": len(alighted), "boarded": len(boarded), "bus_onboard": bus.PassengersOnboard, "dwell_ms": dwell.Milliseconds(), "generated_passengers": engine.GeneratedPassengers, "outbound_generated": engine.OutboundGenerated, "inbound_generated": engine.InboundGenerated})
-							cur = ctrl.speed.Load().(float64); if cur <= 0 { cur = 1 }
-							time.Sleep(time.Duration(float64(dwell) / cur))
+							// Sleep in real time proportionally to simulation dwell
+							waitSim(dwell)
 							// advance simulation time by dwell duration
 							mu.Lock()
 							engine.Now = engine.Now.Add(dwell)
@@ -432,8 +482,9 @@ func main() {
 							lat := stop.Latitude + (next.Latitude-stop.Latitude)*t
 							lng := stop.Longitude + (next.Longitude-stop.Longitude)*t
 							flush("move", map[string]any{"bus_id": bus.ID, "direction": bus.Direction, "lat": lat, "lng": lng, "t": t, "from": stop.ID, "to": next.ID})
-							cur = ctrl.speed.Load().(float64); if cur <= 0 { cur = 1 }
-							time.Sleep(time.Duration(float64(120*time.Millisecond) / cur))
+							// Sleep according to simulation step duration
+							stepSim := travelDur / time.Duration(steps)
+							waitSim(stepSim)
 							// advance simulation time proportionally during travel
 							mu.Lock()
 							engine.Now = engine.Now.Add(travelDur / time.Duration(steps))
@@ -451,9 +502,8 @@ func main() {
 					alighted := bus.AlightPassengersAtCurrentStop(engine.Now)
 					if len(alighted) > 0 { cumServed += int64(len(alighted)); flush("alight", map[string]any{"bus_id": bus.ID, "direction": bus.Direction, "stop_id": bus.CurrentStopID, "alighted": len(alighted), "bus_onboard": bus.PassengersOnboard, "passengers_onboard": bus.PassengersOnboard, "generated_passengers": engine.GeneratedPassengers, "final": true, "served_passengers": cumServed}) }
 					mu.Unlock()
-					// pause at terminal
-					cur = ctrl.speed.Load().(float64); if cur <= 0 { cur = 1 }
-					time.Sleep(time.Duration(float64(terminalDwell) / cur))
+					// pause at terminal (simulation time)
+					waitSim(terminalDwell)
 					// advance simulation time by terminal dwell
 					mu.Lock()
 					engine.Now = engine.Now.Add(terminalDwell)
@@ -472,9 +522,8 @@ func main() {
 							alighted := bus.AlightPassengersAtCurrentStop(engine.Now)
 							if len(alighted) > 0 { cumServed += int64(len(alighted)); flush("alight", map[string]any{"bus_id": bus.ID, "direction": bus.Direction, "stop_id": stop.ID, "alighted": len(alighted), "bus_onboard": bus.PassengersOnboard, "passengers_onboard": bus.PassengersOnboard, "generated_passengers": engine.GeneratedPassengers, "outbound_generated": engine.OutboundGenerated, "inbound_generated": engine.InboundGenerated, "served_passengers": cumServed}) }
 						mu.Unlock()
-						// Pause so onboard decrease is visible before boarding
-						cur := ctrl.speed.Load().(float64); if cur <= 0 { cur = 1 }
-						time.Sleep(time.Duration(float64(650*time.Millisecond) / cur))
+						// Pause so onboard decrease is visible before boarding (simulation time)
+						waitSim(650 * time.Millisecond)
 						mu.Lock()
 						engine.Now = engine.Now.Add(650 * time.Millisecond)
 						mu.Unlock()
@@ -502,8 +551,7 @@ func main() {
 							}
 							log.Printf("Bus %d (%s) STOP %d %s | alight=%d board=%d onboard=%d dwell=%v avg_wait=%.2fmin", bus.ID, bus.Direction, stop.ID, stop.Name, len(alighted), len(boarded), bus.PassengersOnboard, dwell, avgWait2)
 							flush("dwell", map[string]any{"bus_id": bus.ID, "direction": bus.Direction, "stop_id": stop.ID, "alighted": len(alighted), "boarded": len(boarded), "bus_onboard": bus.PassengersOnboard, "dwell_ms": dwell.Milliseconds(), "generated_passengers": engine.GeneratedPassengers, "outbound_generated": engine.OutboundGenerated, "inbound_generated": engine.InboundGenerated})
-							cur = ctrl.speed.Load().(float64); if cur <= 0 { cur = 1 }
-							time.Sleep(time.Duration(float64(dwell) / cur))
+							waitSim(dwell)
 							mu.Lock()
 							engine.Now = engine.Now.Add(dwell)
 							mu.Unlock()
@@ -521,8 +569,8 @@ func main() {
 							lat := stop.Latitude + (prev.Latitude-stop.Latitude)*t
 							lng := stop.Longitude + (prev.Longitude-stop.Longitude)*t
 							flush("move", map[string]any{"bus_id": bus.ID, "direction": bus.Direction, "lat": lat, "lng": lng, "t": t, "from": stop.ID, "to": prev.ID})
-							cur = ctrl.speed.Load().(float64); if cur <= 0 { cur = 1 }
-							time.Sleep(time.Duration(float64(120*time.Millisecond) / cur))
+							stepSim := travelDur / time.Duration(steps)
+							waitSim(stepSim)
 							mu.Lock()
 							engine.Now = engine.Now.Add(travelDur / time.Duration(steps))
 							mu.Unlock()
@@ -539,8 +587,7 @@ func main() {
 					alighted2 := bus.AlightPassengersAtCurrentStop(engine.Now)
 					if len(alighted2) > 0 { cumServed += int64(len(alighted2)); flush("alight", map[string]any{"bus_id": bus.ID, "direction": bus.Direction, "stop_id": bus.CurrentStopID, "alighted": len(alighted2), "bus_onboard": bus.PassengersOnboard, "passengers_onboard": bus.PassengersOnboard, "generated_passengers": engine.GeneratedPassengers, "outbound_generated": engine.OutboundGenerated, "inbound_generated": engine.InboundGenerated, "final": true, "served_passengers": cumServed}) }
 					mu.Unlock()
-					cur = ctrl.speed.Load().(float64); if cur <= 0 { cur = 1 }
-					time.Sleep(time.Duration(float64(terminalDwell) / cur))
+					waitSim(terminalDwell)
 					mu.Lock()
 					engine.Now = engine.Now.Add(terminalDwell)
 					mu.Unlock()
@@ -579,11 +626,7 @@ func main() {
 				for _, s := range route.Stops { sum += s.DistanceToNext }
 				if sum > 0 { routeDistance = sum }
 			}
-			// mapping from sim time to real time; baseline scaled by initial speed for launch schedule only
-			simSecToReal := 0.2 // 1 sim sec ≈ 0.2 real sec => 1 sim min ≈ 12s real
-			simMinToReal := (simSecToReal * float64(time.Second) * 60.0) / ctrl.speed.Load().(float64)
-
-			makeSchedule := func(list []*model.Bus) []struct{ bus *model.Bus; delay time.Duration } {
+			makeSchedule := func(list []*model.Bus) []struct{ bus *model.Bus; simDelay time.Duration } {
 				n := len(list)
 				if n == 0 { return nil }
 				// average speed among these buses
@@ -595,15 +638,15 @@ func main() {
 				headwayMin := tripMin / float64(n)
 				if headwayMin < 0.5 { headwayMin = 0.5 }
 				if headwayMin > 15 { headwayMin = 15 }
-				sched := make([]struct{ bus *model.Bus; delay time.Duration }, 0, n)
+				sched := make([]struct{ bus *model.Bus; simDelay time.Duration }, 0, n)
 				for i, b := range list {
 					base := float64(i) * headwayMin
 					// jitter ±20%
 					jitter := (baseRNG.Float64()*0.4 - 0.2) * headwayMin
 					simOffsetMin := base + jitter
 					if simOffsetMin < 0 { simOffsetMin = 0 }
-					realDelay := time.Duration(simOffsetMin * simMinToReal)
-					sched = append(sched, struct{ bus *model.Bus; delay time.Duration }{bus: b, delay: realDelay})
+					simDelay := time.Duration(simOffsetMin * float64(time.Minute))
+					sched = append(sched, struct{ bus *model.Bus; simDelay time.Duration }{bus: b, simDelay: simDelay})
 				}
 				return sched
 			}
@@ -614,8 +657,9 @@ func main() {
 				bus := item.bus
 				forward := bus.Direction == "outbound"
 				wg.Add(1)
-				go func(bu *model.Bus, fwd bool, d time.Duration) {
-					time.Sleep(d)
+				go func(bu *model.Bus, fwd bool, simD time.Duration) {
+					// wait simulation time using dynamic speed
+					waitSim(simD)
 					// notify frontend and place at starting terminal
 					cap := 0
 					if bu.Type != nil { cap = bu.Type.Capacity }
@@ -631,7 +675,7 @@ func main() {
 					}
 					flush("move", map[string]any{"bus_id": bu.ID, "direction": bu.Direction, "lat": lat, "lng": lng, "from": 0, "to": bu.CurrentStopID, "t": 0})
 					simulate(bu, fwd)
-				}(bus, forward, item.delay)
+				}(bus, forward, item.simDelay)
 			}
 
 			// Wait for simulate goroutines to finish (stopCh closed), then ensure generator finished
@@ -674,11 +718,11 @@ func main() {
 			// Compute costs per bus
 			totalCost := 0.0
 			totalDist := 0.0
-			log.Println("=== Simulation Report ===")
-			log.Printf("Buses on route: %d", len(connBuses))
-			log.Printf("Passengers generated: %d", engine.GeneratedPassengers)
-			log.Printf("Passengers served: %d", cumServed)
-			log.Printf("Average wait: %.2f minutes", avgFinal)
+			fmt.Println("=== Simulation Report ===")
+			fmt.Printf("Buses on route: %d", len(connBuses))
+			fmt.Printf("Passengers generated: %d", engine.GeneratedPassengers)
+			fmt.Printf("Passengers served: %d", cumServed)
+			fmt.Printf("Average wait: %.2f minutes", avgFinal)
 			for _, b := range connBuses {
 				d := busDistance[b.ID]
 				c := 0.0
@@ -687,10 +731,10 @@ func main() {
 				totalCost += c
 				name := ""
 				if b.Type != nil { name = b.Type.Name }
-				log.Printf("Bus %d (%s, %s) distance=%.2f km cost=%.2f", b.ID, b.Direction, name, d, c)
+				fmt.Printf("Bus %d (%s, %s) distance=%.2f km cost=%.2f", b.ID, b.Direction, name, d, c)
 			}
-			log.Printf("Total distance: %.2f km", totalDist)
-			log.Printf("Total operating cost: %.2f", totalCost)
+			fmt.Printf("Total distance: %.2f km", totalDist)
+			fmt.Printf("Total operating cost: %.2f", totalCost)
 	})
 
 	log.Println("Serving on :8080")
