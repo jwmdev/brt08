@@ -1,0 +1,40 @@
+{
+  "periods": [
+    {
+      "period_id": 1,
+      "period_name": "Eearly Morning",
+      "start_time": "04:00",
+      "end_time": "06:00"
+    },
+    {
+      "period_id": 2,
+      "period_name": "Morning Peak",
+      "start_time": "06:00",
+      "end_time": "09:00"
+    },
+    {
+      "period_id": 3,
+      "period_name": "Late Morning",
+      "start_time": "09:00",
+      "end_time": "12:00"
+    },
+    {
+      "period_id": 4,
+      "period_name": "Afternoon",
+      "start_time": "12:00",
+      "end_time": "15:00"
+    },
+    {
+      "period_id": 5,
+      "period_name": "Evening Peak",
+      "start_time": "15:00",
+      "end_time": "19:00"
+    },
+    {
+      "period_id": 6,
+      "period_name": "Night",
+      "start_time": "19:00",
+      "end_time": "23:00"
+    }
+  ]
+}

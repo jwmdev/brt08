@@ -218,11 +218,37 @@ async function init() {
 
   // transient labels removed per new behavior request
 
-  function updateLegendText(text: string) {
-    const el = document.getElementById('legend');
-    if (el) el.innerHTML = text;
+  let totals = { total: 0, outbound: 0, inbound: 0 };
+  let legendState = 'Waiting for simulation...';
+  // Plain absolute legend (simpler & guaranteed visibility)
+  if (!document.getElementById('legend-style')) {
+    const style = document.createElement('style');
+    style.id = 'legend-style';
+    style.textContent = `
+      #legend { position:absolute; left:12px; bottom:12px; background:#fff; padding:8px 10px; font-size:12px; line-height:1.2; box-shadow:0 2px 6px rgba(0,0,0,0.25); border-radius:4px; z-index:1000; font-family:system-ui,Arial,sans-serif; display:inline-block; width:auto; max-width:260px; top:auto!important; height:auto!important; }
+      #legend strong { font-weight:600; }
+    `;
+    document.head.appendChild(style);
   }
-  updateLegendText(`Route: ${data.route}<br/>Waiting for simulation...`);
+  let legendEl = document.getElementById('legend');
+  if (!legendEl) {
+    legendEl = document.createElement('div');
+    legendEl.id = 'legend';
+    map.getContainer().appendChild(legendEl);
+  }
+  function renderLegend(state?: string) {
+    if (state) legendState = state;
+    const el = document.getElementById('legend');
+    if (!el) return;
+    el.innerHTML = `<div style='font-weight:600;margin-bottom:4px;min-width:150px;'>${data.route}</div>`+
+      `<div style='margin-bottom:4px;'>${legendState}</div>`+
+      `<div>Passengers generated: <strong>${totals.total}</strong></div>`+
+      `<div style='margin-top:2px;'>`+
+      `<span style='color:#1976d2;font-weight:600;'>Outbound: ${totals.outbound}</span><br/>`+
+      `<span style='color:#c62828;font-weight:600;'>Inbound: ${totals.inbound}</span>`+
+      `</div>`;
+  }
+  renderLegend();
 
   // SSE connection
     function openStream(): EventSource {
@@ -240,7 +266,7 @@ async function init() {
       if (reconnectAttempts > 5) return;
       reconnectAttempts++;
       const backoff = 1000 * reconnectAttempts;
-      updateLegendText(`Reconnecting... attempt ${reconnectAttempts}`);
+  renderLegend(`Reconnecting... attempt ${reconnectAttempts}`);
       setTimeout(() => {
         es.close();
         es = openStream();
@@ -252,7 +278,7 @@ async function init() {
       es.addEventListener('error', () => scheduleReconnect());
       es.addEventListener('init', ev => {
         reconnectAttempts = 0;
-        updateLegendText(`Route: ${data.route}<br/>Simulation started`);
+  renderLegend('Simulation started');
         try {
           const d = JSON.parse((ev as MessageEvent).data);
           if (Array.isArray(d.buses)) {
@@ -266,6 +292,12 @@ async function init() {
               if (dir === 'inbound') { lat = stops[stops.length-1].latitute; lng = stops[stops.length-1].longtude; }
               buses[id] = createBusState(id, dir, lat, lng, cap, onboard);
             });
+          }
+          if (typeof d.generated_passengers === 'number') {
+            totals.total = d.generated_passengers;
+            totals.outbound = d.outbound_generated ?? totals.outbound;
+            totals.inbound = d.inbound_generated ?? totals.inbound;
+            renderLegend('Simulation started');
           }
         } catch {}
       });
@@ -283,6 +315,12 @@ async function init() {
             if (typeof d.outbound_queue === 'number') {
               updateStopCount(st.stop_id, d.outbound_queue, d.inbound_queue);
             }
+            if (typeof d.generated_passengers === 'number') {
+              totals.total = d.generated_passengers;
+              if (typeof d.outbound_generated === 'number') totals.outbound = d.outbound_generated;
+              if (typeof d.inbound_generated === 'number') totals.inbound = d.inbound_generated;
+              renderLegend('Running');
+            }
           }
         } catch {}
       });
@@ -298,6 +336,12 @@ async function init() {
           const d = JSON.parse((ev as MessageEvent).data);
           const stp = stops.find(s => s.stop_id === d.stop_id);
           if (stp) updateStopCount(d.stop_id, d.outbound_queue, d.inbound_queue);
+          if (typeof d.generated_passengers === 'number') {
+            totals.total = d.generated_passengers;
+            if (typeof d.outbound_generated === 'number') totals.outbound = d.outbound_generated;
+            if (typeof d.inbound_generated === 'number') totals.inbound = d.inbound_generated;
+            renderLegend('Running');
+          }
         } catch {}
       });
       es.addEventListener('alight', ev => {
@@ -322,11 +366,17 @@ async function init() {
             const outboundQ = d.stop_outbound ?? d.outbound_queue ?? d.stop_queue;
             const inboundQ = d.stop_inbound ?? d.inbound_queue;
             if (typeof outboundQ === 'number') updateStopCount(d.stop_id, outboundQ, typeof inboundQ === 'number' ? inboundQ : undefined);
+            if (typeof d.generated_passengers === 'number') {
+              totals.total = d.generated_passengers;
+              if (typeof d.outbound_generated === 'number') totals.outbound = d.outbound_generated;
+              if (typeof d.inbound_generated === 'number') totals.inbound = d.inbound_generated;
+              renderLegend('Running');
+            }
           }
         } catch {}
       });
       es.addEventListener('done', () => {
-        updateLegendText(`Route: ${data.route}<br/>Trip complete`);
+  renderLegend('Trip complete');
         es.close();
       });
     }

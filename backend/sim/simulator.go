@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"brt08/backend/model"
+	"brt08/backend/data"
 )
 
 // StopStats holds aggregated statistics per stop.
@@ -31,6 +32,14 @@ type Simulator struct {
 
 	LambdaPerMinute float64 // expected passenger arrivals per stop per minute (outbound direction only for this demo)
 
+	PeriodID int            // selected time period id
+	TotalPassengerCap int   // global cap across both directions (0 = unlimited)
+	GeneratedPassengers int // counter of generated passengers
+	MorningTowardKivukoni bool // if true morning bias outbound toward Kivukoni else inbound
+	DirectionBiasFactor float64 // multiplier applied to favored direction
+	OutboundGenerated int  // number of outbound passengers generated
+	InboundGenerated  int  // number of inbound passengers generated
+
 	Completed []*model.Passenger
 	Stats     map[int]*StopStats
 }
@@ -49,6 +58,10 @@ func NewSimulator(route *model.Route, bus *model.Bus, seed int64, lambdaPerMinut
 		Now:            start,
 		LambdaPerMinute: lambdaPerMinute,
 		Stats:          stats,
+	PeriodID:       2, // default morning peak
+	TotalPassengerCap: 0,
+	MorningTowardKivukoni: true,
+	DirectionBiasFactor: 1.4,
 	}
 }
 
@@ -136,18 +149,39 @@ func (s *Simulator) generateArrivals(start, end time.Time, fromIndex int) {
 	if durMinutes <= 0 { return }
 	for i := fromIndex; i < len(s.Route.Stops)-1; i++ { // exclude last stop
 		stop := s.Route.Stops[i]
-		mean := s.LambdaPerMinute * durMinutes
+		mult := data.TimePeriodMultiplier[s.PeriodID]
+		if mult == 0 { mult = 1 }
+		mean := s.LambdaPerMinute * durMinutes * mult
 		count := s.poisson(mean)
 		if count == 0 { continue }
 		ss := s.Stats[stop.ID]
 		for j := 0; j < count; j++ {
+			if s.TotalPassengerCap > 0 && s.GeneratedPassengers >= s.TotalPassengerCap { break }
 			// destination strictly downstream
 			destIdx := i + 1 + s.RNG.Intn(len(s.Route.Stops)-i-1)
 			dest := s.Route.Stops[destIdx]
 			// uniform arrival time in interval
 			t := start.Add(time.Duration(s.RNG.Float64()*durMinutes*float64(time.Minute)))
 			p := s.newPassenger(stop.ID, dest.ID, t)
-			stop.EnqueuePassenger(p, "outbound", t)
+			// Apply directional bias depending on period (simple heuristic):
+			// If PeriodID == 2 (morning peak) favor outbound (toward last stop / Kivukoni) or inbound if MorningTowardKivukoni false.
+			// If PeriodID == 5 (evening peak) invert bias.
+			favoredOutbound := (s.PeriodID == 2 && s.MorningTowardKivukoni) || (s.PeriodID == 5 && !s.MorningTowardKivukoni)
+			favoredInbound := (s.PeriodID == 2 && !s.MorningTowardKivukoni) || (s.PeriodID == 5 && s.MorningTowardKivukoni)
+			if favoredOutbound && p.Direction == "outbound" && s.DirectionBiasFactor > 1 {
+				// keep as is
+			} else if favoredInbound && p.Direction == "inbound" && s.DirectionBiasFactor > 1 {
+				// keep as is
+			} else {
+				// probabilistically drop some unfavored passengers to create skew
+				if s.DirectionBiasFactor > 1 {
+					// Keep unfavored with probability 1/DirectionBiasFactor
+					if s.RNG.Float64() > (1.0 / s.DirectionBiasFactor) { continue }
+				}
+			}
+			stop.EnqueuePassenger(p, p.Direction, t)
+			s.GeneratedPassengers++
+			if p.Direction == "outbound" { s.OutboundGenerated++ } else if p.Direction == "inbound" { s.InboundGenerated++ }
 			ss.ArrivalsGenerated++
 		}
 		ss.RemainingOutbound = len(stop.OutboundQueue)
