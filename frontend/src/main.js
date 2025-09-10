@@ -49,15 +49,16 @@ async function init() {
     const stops = (data.stops || []).map((s) => ({
         stop_id: s.stop_id ?? s.id,
         stop_name: s.stop_name ?? s.name,
-        latitute: s.latitute,
-        longtude: s.longtude,
+        // tolerate multiple schemas (static JSON and backend API)
+        latitute: s.latitute ?? s.latitude ?? s.Latitude ?? s.lat ?? s.Lat,
+        longtude: s.longtude ?? s.longitude ?? s.Longitude ?? s.lng ?? s.Long,
         distance_next_stop: s.distance_next_stop ?? s.distance_to_next ?? s.DistanceToNext ?? 0,
     }));
     const pins = (data.pins || []).map((p) => ({
         left_stop_id: p.left_stop_id,
         right_stop_id: p.right_stop_id,
-        latitute: p.latitute,
-        longtude: p.longtude,
+        latitute: p.latitute ?? p.latitude ?? p.Latitude ?? p.lat,
+        longtude: p.longtude ?? p.longitude ?? p.Longitude ?? p.lng,
     }));
     // Provide route level fallbacks
     data.route = data.route || data.name || 'Route';
@@ -177,6 +178,38 @@ async function init() {
     }
     L.polyline(polyPoints, { color: '#1976d2', weight: 8, opacity: 0.9, lineJoin: 'round', lineCap: 'round' }).addTo(map);
     L.control.layers(baseLayers, {}, { position: 'topright', collapsed: true }).addTo(map);
+    // Controls: speed slider and toggle stop labels
+    if (!document.getElementById('sim-controls-style')) {
+        const style = document.createElement('style');
+        style.id = 'sim-controls-style';
+        style.textContent = `
+      #sim-controls { position:absolute; right:12px; bottom:12px; background:#fff; padding:8px 10px; font-size:12px; line-height:1.2; box-shadow:0 2px 6px rgba(0,0,0,0.25); border-radius:4px; z-index:1000; width:220px; }
+      #sim-controls label { display:block; margin:6px 0 4px; font-weight:600; }
+    `;
+        document.head.appendChild(style);
+    }
+    let ctrl = document.getElementById('sim-controls');
+    if (!ctrl) {
+        ctrl = document.createElement('div');
+        ctrl.id = 'sim-controls';
+        ctrl.innerHTML = `
+      <label>Speed: <span id='speed-val'>1.0x</span></label>
+      <input id='speed-range' type='range' min='0.25' max='4' step='0.25' value='1' style='width:100%'/>
+      <label style='margin-top:8px;'><input id='toggle-stops' type='checkbox' checked/> Show stop labels</label>
+    `;
+        map.getContainer().appendChild(ctrl);
+    }
+    const speedRange = document.getElementById('speed-range');
+    const speedVal = document.getElementById('speed-val');
+    const toggleStops = document.getElementById('toggle-stops');
+    function setStopsVisible(v) {
+        for (const id in stopLabels) {
+            const el = stopLabels[id].getElement();
+            if (el)
+                el.style.display = v ? '' : 'none';
+        }
+    }
+    toggleStops?.addEventListener('change', () => setStopsVisible(toggleStops.checked));
     const buses = {};
     function makeBusLabelHTML(cap, onboard) {
         const ratio = cap > 0 ? onboard / cap : 0;
@@ -210,6 +243,8 @@ async function init() {
         label.addTo(map);
         stopLabels[id] = label;
     });
+    // Apply initial visibility from control (default true if missing)
+    setStopsVisible(toggleStops?.checked ?? true);
     function updateStopCount(id, outbound, inbound) {
         const el = document.querySelector(`div[data-stop='${id}'] div[data-stop-count='${id}']`);
         if (el) {
@@ -236,6 +271,9 @@ async function init() {
     if (!legendEl) {
         legendEl = document.createElement('div');
         legendEl.id = 'legend';
+    }
+    // Ensure legend is inside the Leaflet map container for proper overlay stacking
+    if (legendEl.parentElement !== map.getContainer()) {
         map.getContainer().appendChild(legendEl);
     }
     function renderLegend(state) {
@@ -247,7 +285,7 @@ async function init() {
         el.innerHTML = `<div style='font-weight:600;margin-bottom:4px;min-width:150px;'>${data.route}</div>` +
             `<div style='margin-bottom:4px;'>${legendState}</div>` +
             `<div>Passengers generated: <strong>${totals.total}</strong></div>` +
-            `<div>Passengers served (alighted): <strong>${totals.served}</strong></div>` +
+            `<div>Passengers served: <strong>${totals.served}</strong></div>` +
             `<div>Avg wait: <strong>${totals.avgWaitMin.toFixed(2)} min</strong></div>` +
             `<div style='margin-top:2px;'>` +
             `<span style='color:#1976d2;font-weight:600;'>Outbound: ${totals.outbound}</span><br/>` +
@@ -259,14 +297,17 @@ async function init() {
     function openStream() {
         let es;
         try {
-            es = new EventSource('/api/stream');
+            const sp = Number(speedRange?.value || '1');
+            es = new EventSource(`/api/stream?speed=${encodeURIComponent(String(sp))}`);
         }
         catch {
-            es = new EventSource('http://localhost:8080/api/stream');
+            const sp = Number(speedRange?.value || '1');
+            es = new EventSource(`http://localhost:8080/api/stream?speed=${encodeURIComponent(String(sp))}`);
         }
         return es;
     }
     let es = openStream();
+    let connId = null;
     let reconnectAttempts = 0;
     function scheduleReconnect() {
         if (reconnectAttempts > 5)
@@ -287,6 +328,9 @@ async function init() {
             renderLegend('Simulation started');
             try {
                 const d = JSON.parse(ev.data);
+                if (d.conn_id) {
+                    connId = String(d.conn_id);
+                }
                 if (Array.isArray(d.buses)) {
                     d.buses.forEach((b) => {
                         const id = b.id ?? b.ID;
@@ -299,7 +343,8 @@ async function init() {
                             lat = stops[stops.length - 1].latitute;
                             lng = stops[stops.length - 1].longtude;
                         }
-                        buses[id] = createBusState(id, dir, lat, lng, cap, onboard);
+                        if (!buses[id])
+                            buses[id] = createBusState(id, dir, lat, lng, cap, onboard);
                     });
                 }
                 if (typeof d.generated_passengers === 'number') {
@@ -311,6 +356,24 @@ async function init() {
                     if (typeof d.avg_wait_min === 'number')
                         totals.avgWaitMin = d.avg_wait_min;
                     renderLegend('Simulation started');
+                }
+            }
+            catch { }
+        });
+        // New bus added later (staggered activation)
+        es.addEventListener('bus_add', ev => {
+            try {
+                const d = JSON.parse(ev.data);
+                const id = d.bus_id;
+                const dir = d.direction ?? 'outbound';
+                if (typeof id === 'number' && !buses[id]) {
+                    let lat = stops[0].latitute, lng = stops[0].longtude;
+                    if (dir === 'inbound') {
+                        lat = stops[stops.length - 1].latitute;
+                        lng = stops[stops.length - 1].longtude;
+                    }
+                    const cap = typeof d.capacity === 'number' ? d.capacity : 0;
+                    buses[id] = createBusState(id, dir, lat, lng, cap, 0);
                 }
             }
             catch { }
@@ -447,5 +510,27 @@ async function init() {
         });
     }
     attachHandlers();
+    // Update speed without reconnecting: call backend control endpoint
+    async function postSpeed(sp) {
+        if (!connId)
+            return;
+        const payload = { conn_id: connId, speed: sp };
+        try {
+            await fetch('/api/control', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+        }
+        catch {
+            try {
+                await fetch('http://localhost:8080/api/control', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+            }
+            catch (e) {
+                console.warn('speed control failed', e);
+            }
+        }
+    }
+    speedRange?.addEventListener('input', () => {
+        const sp = Number(speedRange.value) || 1;
+        speedVal.textContent = `${sp.toFixed(2)}x`;
+        postSpeed(sp);
+    });
 }
 init().catch(err => console.error(err));
