@@ -197,6 +197,8 @@ async function init() {
     b.label.setIcon(L.divIcon({ className:'bus-occupancy-label', html: makeBusLabelHTML(b.capacity,b.onboard) }));
   }
 
+  // transient bubble overlays removed per request
+
   // Add passenger count labels
   const stopLabels: Record<number, L.Marker> = {};
   stops.forEach(s => {
@@ -218,7 +220,7 @@ async function init() {
 
   // transient labels removed per new behavior request
 
-  let totals = { total: 0, outbound: 0, inbound: 0 };
+  let totals = { total: 0, outbound: 0, inbound: 0, served: 0, avgWaitMin: 0 };
   let legendState = 'Waiting for simulation...';
   // Plain absolute legend (simpler & guaranteed visibility)
   if (!document.getElementById('legend-style')) {
@@ -243,6 +245,8 @@ async function init() {
     el.innerHTML = `<div style='font-weight:600;margin-bottom:4px;min-width:150px;'>${data.route}</div>`+
       `<div style='margin-bottom:4px;'>${legendState}</div>`+
       `<div>Passengers generated: <strong>${totals.total}</strong></div>`+
+      `<div>Passengers served (alighted): <strong>${totals.served}</strong></div>`+
+      `<div>Avg wait: <strong>${totals.avgWaitMin.toFixed(2)} min</strong></div>`+
       `<div style='margin-top:2px;'>`+
       `<span style='color:#1976d2;font-weight:600;'>Outbound: ${totals.outbound}</span><br/>`+
       `<span style='color:#c62828;font-weight:600;'>Inbound: ${totals.inbound}</span>`+
@@ -297,6 +301,8 @@ async function init() {
             totals.total = d.generated_passengers;
             totals.outbound = d.outbound_generated ?? totals.outbound;
             totals.inbound = d.inbound_generated ?? totals.inbound;
+            if (typeof d.served_passengers === 'number') totals.served = d.served_passengers;
+            if (typeof d.avg_wait_min === 'number') totals.avgWaitMin = d.avg_wait_min;
             renderLegend('Simulation started');
           }
         } catch {}
@@ -320,6 +326,11 @@ async function init() {
               if (typeof d.outbound_generated === 'number') totals.outbound = d.outbound_generated;
               if (typeof d.inbound_generated === 'number') totals.inbound = d.inbound_generated;
               renderLegend('Running');
+            }
+            // also refresh bus tag if onboard provided
+            if (typeof d.bus_id === 'number') {
+              const b = buses[d.bus_id];
+              if (b && typeof d.bus_onboard === 'number') { b.onboard = d.bus_onboard; refreshBus(b); }
             }
           }
         } catch {}
@@ -350,6 +361,7 @@ async function init() {
           if (typeof d.alighted === 'number') {
             const b = buses[d.bus_id];
             if (b) { b.onboard = d.bus_onboard ?? (b.onboard - d.alighted); if (b.onboard < 0) b.onboard = 0; refreshBus(b); }
+            if (typeof d.served_passengers === 'number') { totals.served = d.served_passengers; renderLegend('Running'); }
           }
         } catch {}
       });
@@ -366,12 +378,24 @@ async function init() {
             const outboundQ = d.stop_outbound ?? d.outbound_queue ?? d.stop_queue;
             const inboundQ = d.stop_inbound ?? d.inbound_queue;
             if (typeof outboundQ === 'number') updateStopCount(d.stop_id, outboundQ, typeof inboundQ === 'number' ? inboundQ : undefined);
+            // no dwell bubbles or deltas
             if (typeof d.generated_passengers === 'number') {
               totals.total = d.generated_passengers;
               if (typeof d.outbound_generated === 'number') totals.outbound = d.outbound_generated;
               if (typeof d.inbound_generated === 'number') totals.inbound = d.inbound_generated;
+              if (typeof d.served_passengers === 'number') totals.served = d.served_passengers;
+              if (typeof d.avg_wait_min === 'number') totals.avgWaitMin = d.avg_wait_min;
               renderLegend('Running');
             }
+          }
+        } catch {}
+      });
+      es.addEventListener('dwell', ev => {
+        try {
+          const d = JSON.parse((ev as MessageEvent).data);
+          if (typeof d.bus_id === 'number') {
+            const b = buses[d.bus_id];
+            if (b && typeof d.bus_onboard === 'number') { b.onboard = d.bus_onboard; refreshBus(b); }
           }
         } catch {}
       });

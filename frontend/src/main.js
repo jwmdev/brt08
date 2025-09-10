@@ -52,23 +52,48 @@ async function init() {
         latitute: s.latitute,
         longtude: s.longtude,
         distance_next_stop: s.distance_next_stop ?? s.distance_to_next ?? s.DistanceToNext ?? 0,
-        is_pin: s.is_pin === true
+    }));
+    const pins = (data.pins || []).map((p) => ({
+        left_stop_id: p.left_stop_id,
+        right_stop_id: p.right_stop_id,
+        latitute: p.latitute,
+        longtude: p.longtude,
     }));
     // Provide route level fallbacks
     data.route = data.route || data.name || 'Route';
     data.direction = data.direction || 'outbound';
     const map = L.map('map');
-    const osm = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-        maxZoom: 19,
+    // Define multiple detailed base layers
+    const osmStandard = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        maxZoom: 20,
         attribution: '&copy; OpenStreetMap contributors'
     });
-    osm.addTo(map);
+    const osmHot = L.tileLayer('https://{s}.tile.openstreetmap.fr/hot/{z}/{x}/{y}.png', {
+        maxZoom: 20,
+        attribution: '© OpenStreetMap contributors, Tiles style by Humanitarian OpenStreetMap Team hosted by OSM France'
+    });
+    const cartoVoyager = L.tileLayer('https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png', {
+        maxZoom: 20,
+        attribution: '© OpenStreetMap contributors © CARTO'
+    });
+    const openTopo = L.tileLayer('https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png', {
+        maxZoom: 17,
+        attribution: '© OpenStreetMap contributors, SRTM | Style: © OpenTopoMap (CC-BY-SA)'
+    });
+    // Choose a more detailed / legible default (Carto Voyager)
+    cartoVoyager.addTo(map);
+    const baseLayers = {
+        'Carto Voyager': cartoVoyager,
+        'OSM Standard': osmStandard,
+        'OSM HOT': osmHot,
+        'OpenTopoMap': openTopo,
+    };
     // Fit map to stops bounds
-    const visibleStopMarkers = stops.filter(s => !s.is_pin).map(createStopMarker);
+    const visibleStopMarkers = stops.map(createStopMarker);
     const group = L.featureGroup(visibleStopMarkers);
     group.addTo(map);
     map.fitBounds(group.getBounds().pad(0.15));
-    // Catmull-Rom spline (centripetal variant simplified) that passes through original stop points.
+    // Original centripetal Catmull-Rom spline that passes through every original point.
     function catmullRom(points, segmentsPerEdge = 16) {
         if (points.length < 3)
             return points;
@@ -85,11 +110,10 @@ async function init() {
             const P1 = clamp(i);
             const P2 = clamp(i + 1);
             const P3 = clamp(i + 2);
-            // Include the actual stop point (except after first iteration will be added by previous segment end)
             if (i === 0)
                 pts.push([P1[0], P1[1]]);
             for (let s = 1; s <= segmentsPerEdge; s++) {
-                const t = s / segmentsPerEdge; // 0..1
+                const t = s / segmentsPerEdge;
                 const t2 = t * t;
                 const t3 = t2 * t;
                 const x = 0.5 * ((2 * P1[0]) + (-P0[0] + P2[0]) * t + (2 * P0[0] - 5 * P1[0] + 4 * P2[0] - P3[0]) * t2 + (-P0[0] + 3 * P1[0] - 3 * P2[0] + P3[0]) * t3);
@@ -98,19 +122,33 @@ async function init() {
                     pts.push([x, y]);
                 }
                 else {
-                    // fallback to raw point if numeric issue
                     pts.push([P2[0], P2[1]]);
                 }
             }
         }
-        // Guarantee last original point present
         const last = points[points.length - 1];
         const tail = pts[pts.length - 1];
         if (!tail || tail[0] !== last[0] || tail[1] !== last[1])
             pts.push(last);
         return pts;
     }
-    const rawPoints = stops.map(s => [s.latitute, s.longtude]); // includes pins for geometry
+    // Build geometry list inserting pins between their referenced stops
+    const stopIndex = {};
+    stops.forEach((s, i) => { stopIndex[s.stop_id] = i; });
+    const rawPoints = [];
+    for (let i = 0; i < stops.length; i++) {
+        const s = stops[i];
+        rawPoints.push([s.latitute, s.longtude]);
+        // find pins whose left_stop_id is this stop and right matches next stop
+        const next = stops[i + 1];
+        if (next) {
+            pins.forEach(p => {
+                if (p.left_stop_id === s.stop_id && p.right_stop_id === next.stop_id) {
+                    rawPoints.push([p.latitute, p.longtude]);
+                }
+            });
+        }
+    }
     let polyPoints = rawPoints;
     try {
         // filter consecutive duplicates
@@ -119,7 +157,7 @@ async function init() {
             if (!dedup.length || dedup[dedup.length - 1][0] !== p[0] || dedup[dedup.length - 1][1] !== p[1])
                 dedup.push(p);
         }
-        polyPoints = catmullRom(dedup, 14);
+        polyPoints = catmullRom(dedup, 16); // revert: stronger sampling with original spline
         // Ensure all original stops are in the polyline sequence (for hit-testing / pass-through guarantee)
         for (const orig of dedup) {
             let contained = false;
@@ -138,16 +176,10 @@ async function init() {
         polyPoints = rawPoints;
     }
     L.polyline(polyPoints, { color: '#1976d2', weight: 8, opacity: 0.9, lineJoin: 'round', lineCap: 'round' }).addTo(map);
-    // Bus marker for live updates
-    const firstNonPin = stops.find(s => !s.is_pin) || stops[0];
-    const bus = L.marker([firstNonPin.latitute, firstNonPin.longtude], { icon: createBusIcon() }).addTo(map);
-    // Bus occupancy label (div icon hovering above the bus)
-    let busCapacity = 0;
-    let busOnboard = 0;
-    const makeBusLabelHTML = () => {
-        const cap = busCapacity || '?';
-        const occ = busOnboard;
-        const ratio = busCapacity > 0 ? occ / busCapacity : 0;
+    L.control.layers(baseLayers, {}, { position: 'topright', collapsed: true }).addTo(map);
+    const buses = {};
+    function makeBusLabelHTML(cap, onboard) {
+        const ratio = cap > 0 ? onboard / cap : 0;
         let color = '#2e7d32';
         if (ratio >= 0.9)
             color = '#c62828';
@@ -155,18 +187,22 @@ async function init() {
             color = '#ef6c00';
         else if (ratio >= 0.5)
             color = '#f9a825';
-        return `<div style=\"transform:translate(-40%, 80%);background:#fff;border:1px solid #111;padding:3px 8px;border-radius:6px;font-size:12px;line-height:1.05;font-family:monospace;font-weight:600;min-width:30px;text-align:center;box-shadow:0 1px 5px rgba(0,0,0,.45);\"><span style='color:${color};'>${occ}</span>/<span>${cap}</span></div>`;
-    };
-    const busLabel = L.marker(bus.getLatLng(), { interactive: false, icon: L.divIcon({ className: 'bus-occupancy-label', html: makeBusLabelHTML() }) }).addTo(map);
-    function refreshBusLabel() {
-        busLabel.setLatLng(bus.getLatLng());
-        busLabel.setIcon(L.divIcon({ className: 'bus-occupancy-label', html: makeBusLabelHTML() }));
+        const capTxt = cap || '?';
+        return `<div style=\"transform:translate(-40%, 80%);background:#fff;border:1px solid #111;padding:3px 8px;border-radius:6px;font-size:12px;line-height:1.05;font-family:monospace;font-weight:600;min-width:30px;text-align:center;box-shadow:0 1px 5px rgba(0,0,0,.45);\"><span style='color:${color};'>${onboard}</span>/<span>${capTxt}</span></div>`;
     }
+    function createBusState(id, direction, lat, lng, capacity, onboard) {
+        const m = L.marker([lat, lng], { icon: createBusIcon(), title: `Bus ${id} (${direction})` }).addTo(map);
+        const lbl = L.marker([lat, lng], { interactive: false, icon: L.divIcon({ className: 'bus-occupancy-label', html: makeBusLabelHTML(capacity, onboard) }) }).addTo(map);
+        return { id, direction, marker: m, label: lbl, capacity, onboard };
+    }
+    function refreshBus(b) {
+        b.label.setLatLng(b.marker.getLatLng());
+        b.label.setIcon(L.divIcon({ className: 'bus-occupancy-label', html: makeBusLabelHTML(b.capacity, b.onboard) }));
+    }
+    // transient bubble overlays removed per request
     // Add passenger count labels
     const stopLabels = {};
     stops.forEach(s => {
-        if (s.is_pin)
-            return; // skip labeling geometry-only pins
         const id = s.stop_id;
         const label = L.marker([s.latitute, s.longtude], {
             icon: L.divIcon({ className: 'stop-count-label', html: `<div data-stop="${id}" style="transform: translate(-50%, -135%); background:#fff; padding:4px 6px; border:1px solid #222; border-radius:6px; font-size:11px; font-family:monospace; min-width:70px; text-align:center; box-shadow:0 1px 4px rgba(0,0,0,.4);"><div style='font-weight:600; white-space:nowrap;'>${s.stop_name}</div><div class='count' data-stop-count='${id}' style='margin-top:2px; font-size:12px;'>0</div></div>` })
@@ -174,18 +210,51 @@ async function init() {
         label.addTo(map);
         stopLabels[id] = label;
     });
-    function updateStopCount(id, value) {
+    function updateStopCount(id, outbound, inbound) {
         const el = document.querySelector(`div[data-stop='${id}'] div[data-stop-count='${id}']`);
-        if (el)
-            el.textContent = String(value);
+        if (el) {
+            if (inbound == null)
+                el.textContent = String(outbound);
+            else
+                el.textContent = `${outbound}/${inbound}`; // show outbound/inbound
+        }
     }
     // transient labels removed per new behavior request
-    function updateLegendText(text) {
-        const el = document.getElementById('legend');
-        if (el)
-            el.innerHTML = text;
+    let totals = { total: 0, outbound: 0, inbound: 0, served: 0, avgWaitMin: 0 };
+    let legendState = 'Waiting for simulation...';
+    // Plain absolute legend (simpler & guaranteed visibility)
+    if (!document.getElementById('legend-style')) {
+        const style = document.createElement('style');
+        style.id = 'legend-style';
+        style.textContent = `
+      #legend { position:absolute; left:12px; bottom:12px; background:#fff; padding:8px 10px; font-size:12px; line-height:1.2; box-shadow:0 2px 6px rgba(0,0,0,0.25); border-radius:4px; z-index:1000; font-family:system-ui,Arial,sans-serif; display:inline-block; width:auto; max-width:260px; top:auto!important; height:auto!important; }
+      #legend strong { font-weight:600; }
+    `;
+        document.head.appendChild(style);
     }
-    updateLegendText(`Route: ${data.route}<br/>Waiting for simulation...`);
+    let legendEl = document.getElementById('legend');
+    if (!legendEl) {
+        legendEl = document.createElement('div');
+        legendEl.id = 'legend';
+        map.getContainer().appendChild(legendEl);
+    }
+    function renderLegend(state) {
+        if (state)
+            legendState = state;
+        const el = document.getElementById('legend');
+        if (!el)
+            return;
+        el.innerHTML = `<div style='font-weight:600;margin-bottom:4px;min-width:150px;'>${data.route}</div>` +
+            `<div style='margin-bottom:4px;'>${legendState}</div>` +
+            `<div>Passengers generated: <strong>${totals.total}</strong></div>` +
+            `<div>Passengers served (alighted): <strong>${totals.served}</strong></div>` +
+            `<div>Avg wait: <strong>${totals.avgWaitMin.toFixed(2)} min</strong></div>` +
+            `<div style='margin-top:2px;'>` +
+            `<span style='color:#1976d2;font-weight:600;'>Outbound: ${totals.outbound}</span><br/>` +
+            `<span style='color:#c62828;font-weight:600;'>Inbound: ${totals.inbound}</span>` +
+            `</div>`;
+    }
+    renderLegend();
     // SSE connection
     function openStream() {
         let es;
@@ -204,7 +273,7 @@ async function init() {
             return;
         reconnectAttempts++;
         const backoff = 1000 * reconnectAttempts;
-        updateLegendText(`Reconnecting... attempt ${reconnectAttempts}`);
+        renderLegend(`Reconnecting... attempt ${reconnectAttempts}`);
         setTimeout(() => {
             es.close();
             es = openStream();
@@ -215,15 +284,33 @@ async function init() {
         es.addEventListener('error', () => scheduleReconnect());
         es.addEventListener('init', ev => {
             reconnectAttempts = 0;
-            updateLegendText(`Route: ${data.route}<br/>Simulation started`);
+            renderLegend('Simulation started');
             try {
                 const d = JSON.parse(ev.data);
-                if (d.bus) {
-                    // Go JSON uses lower-case tags we normalized above; handle both shapes
-                    const b = d.bus;
-                    busCapacity = b?.type?.capacity ?? b?.Type?.capacity ?? b?.Type?.Capacity ?? busCapacity;
-                    busOnboard = b?.passengers_onboard ?? b?.PassengersOnboard ?? 0;
-                    refreshBusLabel();
+                if (Array.isArray(d.buses)) {
+                    d.buses.forEach((b) => {
+                        const id = b.id ?? b.ID;
+                        const dir = b.direction ?? b.Direction ?? 'outbound';
+                        const cap = b?.type?.capacity ?? b?.Type?.capacity ?? b?.Type?.Capacity ?? 0;
+                        const onboard = b.passengers_onboard ?? b.PassengersOnboard ?? 0;
+                        // initial position: first stop for outbound, last stop for inbound
+                        let lat = stops[0].latitute, lng = stops[0].longtude;
+                        if (dir === 'inbound') {
+                            lat = stops[stops.length - 1].latitute;
+                            lng = stops[stops.length - 1].longtude;
+                        }
+                        buses[id] = createBusState(id, dir, lat, lng, cap, onboard);
+                    });
+                }
+                if (typeof d.generated_passengers === 'number') {
+                    totals.total = d.generated_passengers;
+                    totals.outbound = d.outbound_generated ?? totals.outbound;
+                    totals.inbound = d.inbound_generated ?? totals.inbound;
+                    if (typeof d.served_passengers === 'number')
+                        totals.served = d.served_passengers;
+                    if (typeof d.avg_wait_min === 'number')
+                        totals.avgWaitMin = d.avg_wait_min;
+                    renderLegend('Simulation started');
                 }
             }
             catch { }
@@ -231,13 +318,32 @@ async function init() {
         es.addEventListener('arrive', ev => {
             try {
                 const d = JSON.parse(ev.data);
-                const st = stops.find(s => s.stop_id === d.stop_id && !s.is_pin);
+                const st = stops.find(s => s.stop_id === d.stop_id);
                 if (st) {
                     // subtle pulse effect on arrival
                     const el = document.querySelector(`div[data-stop='${st.stop_id}']`);
                     if (el) {
                         el.classList.add('pulse');
                         setTimeout(() => el.classList.remove('pulse'), 600);
+                    }
+                    if (typeof d.outbound_queue === 'number') {
+                        updateStopCount(st.stop_id, d.outbound_queue, d.inbound_queue);
+                    }
+                    if (typeof d.generated_passengers === 'number') {
+                        totals.total = d.generated_passengers;
+                        if (typeof d.outbound_generated === 'number')
+                            totals.outbound = d.outbound_generated;
+                        if (typeof d.inbound_generated === 'number')
+                            totals.inbound = d.inbound_generated;
+                        renderLegend('Running');
+                    }
+                    // also refresh bus tag if onboard provided
+                    if (typeof d.bus_id === 'number') {
+                        const b = buses[d.bus_id];
+                        if (b && typeof d.bus_onboard === 'number') {
+                            b.onboard = d.bus_onboard;
+                            refreshBus(b);
+                        }
                     }
                 }
             }
@@ -246,17 +352,28 @@ async function init() {
         es.addEventListener('move', ev => {
             try {
                 const d = JSON.parse(ev.data);
-                bus.setLatLng([d.lat, d.lng]);
-                refreshBusLabel();
+                const b = buses[d.bus_id];
+                if (b) {
+                    b.marker.setLatLng([d.lat, d.lng]);
+                    refreshBus(b);
+                }
             }
             catch { }
         });
         es.addEventListener('stop_update', ev => {
             try {
                 const d = JSON.parse(ev.data);
-                const stp = stops.find(s => s.stop_id === d.stop_id && !s.is_pin);
+                const stp = stops.find(s => s.stop_id === d.stop_id);
                 if (stp)
-                    updateStopCount(d.stop_id, d.outbound_queue);
+                    updateStopCount(d.stop_id, d.outbound_queue, d.inbound_queue);
+                if (typeof d.generated_passengers === 'number') {
+                    totals.total = d.generated_passengers;
+                    if (typeof d.outbound_generated === 'number')
+                        totals.outbound = d.outbound_generated;
+                    if (typeof d.inbound_generated === 'number')
+                        totals.inbound = d.inbound_generated;
+                    renderLegend('Running');
+                }
             }
             catch { }
         });
@@ -264,10 +381,17 @@ async function init() {
             try {
                 const d = JSON.parse(ev.data);
                 if (typeof d.alighted === 'number') {
-                    busOnboard = d.bus_onboard ?? (busOnboard - d.alighted);
-                    if (busOnboard < 0)
-                        busOnboard = 0;
-                    refreshBusLabel();
+                    const b = buses[d.bus_id];
+                    if (b) {
+                        b.onboard = d.bus_onboard ?? (b.onboard - d.alighted);
+                        if (b.onboard < 0)
+                            b.onboard = 0;
+                        refreshBus(b);
+                    }
+                    if (typeof d.served_passengers === 'number') {
+                        totals.served = d.served_passengers;
+                        renderLegend('Running');
+                    }
                 }
             }
             catch { }
@@ -276,18 +400,49 @@ async function init() {
             try {
                 const d = JSON.parse(ev.data);
                 if (typeof d.boarded === 'number') {
-                    busOnboard = d.bus_onboard ?? (busOnboard + d.boarded);
-                    if (busCapacity && busOnboard > busCapacity)
-                        busOnboard = busCapacity;
-                    if (typeof d.stop_queue === 'number')
-                        updateStopCount(d.stop_id, d.stop_queue);
-                    refreshBusLabel();
+                    const b = buses[d.bus_id];
+                    if (b) {
+                        b.onboard = d.bus_onboard ?? (b.onboard + d.boarded);
+                        if (b.capacity && b.onboard > b.capacity)
+                            b.onboard = b.capacity;
+                        refreshBus(b);
+                    }
+                    const outboundQ = d.stop_outbound ?? d.outbound_queue ?? d.stop_queue;
+                    const inboundQ = d.stop_inbound ?? d.inbound_queue;
+                    if (typeof outboundQ === 'number')
+                        updateStopCount(d.stop_id, outboundQ, typeof inboundQ === 'number' ? inboundQ : undefined);
+                    // no dwell bubbles or deltas
+                    if (typeof d.generated_passengers === 'number') {
+                        totals.total = d.generated_passengers;
+                        if (typeof d.outbound_generated === 'number')
+                            totals.outbound = d.outbound_generated;
+                        if (typeof d.inbound_generated === 'number')
+                            totals.inbound = d.inbound_generated;
+                        if (typeof d.served_passengers === 'number')
+                            totals.served = d.served_passengers;
+                        if (typeof d.avg_wait_min === 'number')
+                            totals.avgWaitMin = d.avg_wait_min;
+                        renderLegend('Running');
+                    }
+                }
+            }
+            catch { }
+        });
+        es.addEventListener('dwell', ev => {
+            try {
+                const d = JSON.parse(ev.data);
+                if (typeof d.bus_id === 'number') {
+                    const b = buses[d.bus_id];
+                    if (b && typeof d.bus_onboard === 'number') {
+                        b.onboard = d.bus_onboard;
+                        refreshBus(b);
+                    }
                 }
             }
             catch { }
         });
         es.addEventListener('done', () => {
-            updateLegendText(`Route: ${data.route}<br/>Trip complete`);
+            renderLegend('Trip complete');
             es.close();
         });
     }
