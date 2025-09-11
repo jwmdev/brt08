@@ -16,6 +16,7 @@ type BusStop struct {
     TotalArrivals   int           `json:"total_arrivals"`
     TotalBoarded    int           `json:"total_boarded"`
     TotalDepartures int           `json:"total_departures"` // passengers leaving the queue (boarded)
+    AllowLayover   bool            `json:"allow_layover"`    // if true, buses can wait off the main road
 }
 
 // EnqueuePassenger adds a passenger to the correct directional queue and stamps arrival time if zero.

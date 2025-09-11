@@ -22,6 +22,7 @@ type rawStop struct {
     Lat              float64 `json:"latitute"`
     Lng              float64 `json:"longtude"`
     DistanceNext     float64 `json:"distance_next_stop"`
+    AllowLayover     *bool   `json:"allow_layover"`
 }
 
 type rawPin struct {
@@ -58,6 +59,7 @@ func LoadRouteFromReader(r io.Reader, id int) (*Route, error) {
             DistanceToNext: s.DistanceNext,
             CumulativeDist: cumulative,
         }
+    if s.AllowLayover != nil { bs.AllowLayover = *s.AllowLayover }
         cumulative += s.DistanceNext
         route.Stops = append(route.Stops, bs)
     }

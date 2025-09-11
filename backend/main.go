@@ -206,12 +206,18 @@ func main() {
 			if *passengerCap <= 0 { return false }
 			mu.Lock()
 			defer mu.Unlock()
-			if engine.GeneratedPassengers < *passengerCap { return false }
-			for _, b := range connBuses { if b.PassengersOnboard > 0 { return false } }
-			for _, s := range route.Stops {
-				if len(s.OutboundQueue) > 0 || len(s.InboundQueue) > 0 { return false }
-			}
-			return true
+			// Compute system occupancy (queues + onboard)
+			inSystem := 0
+			for _, b := range connBuses { inSystem += b.PassengersOnboard }
+			for _, s := range route.Stops { inSystem += len(s.OutboundQueue) + len(s.InboundQueue) }
+			// Hard stop if we have actually served the requested passenger_cap
+			if int64(*passengerCap) <= cumServed && inSystem == 0 { return true }
+			// Traditional logic: all target passengers generated AND system empty
+			if engine.GeneratedPassengers >= *passengerCap && inSystem == 0 { return true }
+			// Early stop: all passengers generated so far have been served (no backlog) and no one in system.
+			// This handles slow generation situations where we don't want to keep buses looping empty.
+			if engine.GeneratedPassengers == int(cumServed) && inSystem == 0 { return true }
+			return false
 		}
 		signalStopIfDone := func() {
 			if isDone() { stopOnce.Do(func(){ close(stopCh) }) }
@@ -681,6 +687,87 @@ func main() {
 			// Wait for simulate goroutines to finish (stopCh closed), then ensure generator finished
 			wg.Wait()
 			if genWgPtr != nil && *passengerCap > 0 { genWgPtr.Wait() }
+
+			// Reposition (layover) phase: after all service passengers are cleared, move each bus concurrently to its nearest layover-capable stop.
+			repositionStart := time.Now()
+			if *passengerCap > 0 { // only meaningful in capped simulations
+				// Identify layover-capable stops via explicit AllowLayover flag; always include endpoints as safe layover.
+				layoverIdxSet := make(map[int]struct{})
+				for i, st := range route.Stops { if st.AllowLayover { layoverIdxSet[i] = struct{}{} } }
+				layoverIdxSet[0] = struct{}{}
+				layoverIdxSet[len(route.Stops)-1] = struct{}{}
+				layoverIdxs := make([]int, 0, len(layoverIdxSet))
+				for idx := range layoverIdxSet { layoverIdxs = append(layoverIdxs, idx) }
+				flush("reposition_start", map[string]any{"buses": len(connBuses), "layover_indices": layoverIdxs})
+				var repWg sync.WaitGroup
+				repWg.Add(len(connBuses))
+				for _, b := range connBuses {
+					bus := b
+					go func() {
+						defer repWg.Done()
+						// locate current index
+						curIdx := -1
+						for i, st := range route.Stops { if st.ID == bus.CurrentStopID { curIdx = i; break } }
+						if curIdx == -1 { return }
+						// Direction-aware selection: prefer nearest layover AHEAD; if none ahead, fallback to nearest overall.
+						forward := (bus.Direction == "outbound")
+						bestIdx := -1
+						bestDist := 1<<30
+						// pass 1: ahead only
+						for _, li := range layoverIdxs {
+							if forward && li > curIdx { d := li - curIdx; if d < bestDist { bestDist = d; bestIdx = li } }
+							if !forward && li < curIdx { d := curIdx - li; if d < bestDist { bestDist = d; bestIdx = li } }
+						}
+						aheadFound := (bestIdx != -1)
+						if !aheadFound { // pass 2: nearest any direction
+							bestDist = 1<<30
+							for _, li := range layoverIdxs {
+								d := li - curIdx; if d < 0 { d = -d }
+								if d < bestDist { bestDist = d; bestIdx = li }
+							}
+						}
+						flush("reposition_bus", map[string]any{"bus_id": bus.ID, "from_index": curIdx, "target_index": bestIdx, "current_stop_id": route.Stops[curIdx].ID, "ahead_only": aheadFound})
+						if bestIdx == -1 || bestIdx == curIdx { // already at layover
+							flush("layover", map[string]any{"bus_id": bus.ID, "terminal_stop_id": route.Stops[curIdx].ID})
+							return
+						}
+						step := 1
+						if bestIdx < curIdx { step = -1 }
+						for idx := curIdx; idx != bestIdx; idx += step {
+							from := route.Stops[idx]
+							to := route.Stops[idx+step]
+							// distance along this segment
+							dist := from.DistanceToNext
+							if step == -1 { // reverse: segment distance held in previous stop
+								prev := route.Stops[idx-1]
+								dist = prev.DistanceToNext
+							}
+							travelMin := dist / bus.AverageSpeedKmph * 60
+							if travelMin < 0 { travelMin = 0 }
+							travelDur := time.Duration(travelMin * float64(time.Minute))
+							steps := int(travelDur / (800 * time.Millisecond))
+							if steps < 1 { steps = 1 }
+							for sstep := 1; sstep <= steps; sstep++ {
+								t := float64(sstep) / float64(steps)
+								lat := from.Latitude + (to.Latitude-from.Latitude)*t
+								lng := from.Longitude + (to.Longitude-from.Longitude)*t
+								flush("move", map[string]any{"bus_id": bus.ID, "direction": bus.Direction, "lat": lat, "lng": lng, "t": t, "from": from.ID, "to": to.ID, "phase": "reposition"})
+								stepSim := travelDur / time.Duration(steps)
+								waitSim(stepSim)
+								mu.Lock(); engine.Now = engine.Now.Add(stepSim); busDistance[bus.ID] += dist/float64(steps); mu.Unlock()
+							}
+							// add remaining distance fraction (already added per step) adjust current stop id
+							bus.CurrentStopID = to.ID
+						}
+						// Ensure total distance adds exact segment distances (in case of rounding): recompute precisely
+						// (Optional correction skipped for simplicity)
+						flush("layover", map[string]any{"bus_id": bus.ID, "terminal_stop_id": route.Stops[bestIdx].ID})
+					}()
+				}
+				repWg.Wait()
+				flush("reposition_complete", map[string]any{"elapsed_ms": time.Since(repositionStart).Milliseconds()})
+			}
+
 			avgFinal := 0.0
 			if waitCount > 0 { avgFinal = waitSumMin / float64(waitCount) }
 			flush("done", map[string]any{"completed": true, "generated_passengers": engine.GeneratedPassengers, "outbound_generated": engine.OutboundGenerated, "inbound_generated": engine.InboundGenerated, "served_passengers": cumServed, "avg_wait_min": avgFinal})
@@ -719,10 +806,10 @@ func main() {
 			totalCost := 0.0
 			totalDist := 0.0
 			fmt.Println("=== Simulation Report ===")
-			fmt.Printf("Buses on route: %d", len(connBuses))
-			fmt.Printf("Passengers generated: %d", engine.GeneratedPassengers)
-			fmt.Printf("Passengers served: %d", cumServed)
-			fmt.Printf("Average wait: %.2f minutes", avgFinal)
+			fmt.Printf("Buses on route: %d\n", len(connBuses))
+			fmt.Printf("Passengers generated: %d\n", engine.GeneratedPassengers)
+			fmt.Printf("Passengers served: %d\n", cumServed)
+			fmt.Printf("Average wait: %.2f minutes\n", avgFinal)
 			for _, b := range connBuses {
 				d := busDistance[b.ID]
 				c := 0.0
@@ -731,10 +818,10 @@ func main() {
 				totalCost += c
 				name := ""
 				if b.Type != nil { name = b.Type.Name }
-				fmt.Printf("Bus %d (%s, %s) distance=%.2f km cost=%.2f", b.ID, b.Direction, name, d, c)
+				fmt.Printf("Bus %d (%s, %s) distance=%.2f km cost=%.2f\n", b.ID, b.Direction, name, d, c)
 			}
-			fmt.Printf("Total distance: %.2f km", totalDist)
-			fmt.Printf("Total operating cost: %.2f", totalCost)
+			fmt.Printf("Total distance: %.2f km\n", totalDist)
+			fmt.Printf("Total operating cost: %.2f\n", totalCost)
 	})
 
 	log.Println("Serving on :8080")

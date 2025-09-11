@@ -218,7 +218,7 @@ async function init() {
     else if (ratio >= 0.7) color = '#ef6c00';
     else if (ratio >= 0.5) color = '#f9a825';
     const capTxt = cap || '?';
-    return `<div style=\"transform:translate(-40%, 80%);background:#fff;border:1px solid #111;padding:3px 8px;border-radius:6px;font-size:12px;line-height:1.05;font-family:monospace;font-weight:600;min-width:30px;text-align:center;box-shadow:0 1px 5px rgba(0,0,0,.45);\"><span style='color:${color};'>${onboard}</span>/<span>${capTxt}</span></div>`;
+    return `<div style=\"transform:translate(-40%, 80%);background:#fff;border:1px solid #111;padding:3px 8px;border-radius:6px;font-size:12px;line-height:1.05;font-family:monospace;font-weight:600;min-width:40px;text-align:center;box-shadow:0 1px 5px rgba(0,0,0,.45);\"><span style='color:${color};'>${onboard}</span>/<span>${capTxt}</span></div>`;
   }
   function createBusState(id:number, direction:string, lat:number, lng:number, capacity:number, onboard:number): BusState {
     const m = L.marker([lat,lng], { icon: createBusIcon(), title: `Bus ${id} (${direction})` }).addTo(map);
