@@ -270,17 +270,18 @@ func main() {
 					return base + (*spatialGradient)*norm
 				}
 
-				// Small initial seed
+				// Small initial seed (respect cap precisely) done under lock to avoid any race with generator start
 				if seedTarget > 0 {
-					for engine.GeneratedPassengers < seedTarget {
+					mu.Lock()
+					for engine.GeneratedPassengers < seedTarget && (totalTarget == 0 || engine.GeneratedPassengers < totalTarget) {
+						remaining := totalTarget - engine.GeneratedPassengers
+						if totalTarget > 0 && remaining <= 0 { break }
 						// Alternate directions roughly using bias
 						dir := "outbound"
-						// Probability outbound
 						pOutbound := 0.5
 						if favoredOutbound { pOutbound = engine.DirectionBiasFactor / (engine.DirectionBiasFactor + 1.0) } else if favoredInbound { pOutbound = 1.0 / (engine.DirectionBiasFactor + 1.0) }
 						if engine.RNG.Float64() >= pOutbound { dir = "inbound" }
 						if dir == "outbound" {
-							// choose origin weighted
 							weights := make([]float64, len(route.Stops)-1)
 							sum := 0.0
 							for i := 0; i < len(route.Stops)-1; i++ { w := gradientWeightOutbound(i); weights[i] = w; sum += w }
@@ -299,13 +300,12 @@ func main() {
 						} else { // inbound
 							weights := make([]float64, len(route.Stops)-1)
 							sum := 0.0
-							// inbound origins indices 1..len-1
 							for i := 1; i < len(route.Stops); i++ { w := gradientWeightInbound(i); weights[i-1] = w; sum += w }
 							r := engine.RNG.Float64()*sum
 							cum := 0.0
 							originIdxGlobal := 1
 							for k, w := range weights { cum += w; if r <= cum { originIdxGlobal = k+1; break } }
-							destIdx := engine.RNG.Intn(originIdxGlobal) // 0..originIdxGlobal-1
+							destIdx := engine.RNG.Intn(originIdxGlobal)
 							origin := route.Stops[originIdxGlobal]
 							dest := route.Stops[destIdx]
 							arrTime := start.Add(-time.Duration(engine.RNG.Float64()*2*float64(time.Minute)))
@@ -315,6 +315,7 @@ func main() {
 							engine.GeneratedPassengers++; engine.InboundGenerated++
 						}
 					}
+					mu.Unlock()
 				}
 
 				// Emit initial state for all stops after seeding
@@ -345,6 +346,11 @@ func main() {
 							if v := ctrl.arrivalMult.Load(); v != nil { arrMult = v.(float64) }
 							mean := lambda * float64(mult) * stepMin * arrMult
 							count := engine.PoissonPublic(mean)
+							if totalTarget > 0 {
+								remaining := totalTarget - engine.GeneratedPassengers
+								if remaining < 0 { remaining = 0 }
+								if count > remaining { count = remaining }
+							}
 							if count > 0 {
 								// Directional bias probability
 								pOutbound := 0.5
@@ -770,6 +776,8 @@ func main() {
 
 			avgFinal := 0.0
 			if waitCount > 0 { avgFinal = waitSumMin / float64(waitCount) }
+			// Final clamp (defensive) – should never trigger but avoids reporting > cap
+			if *passengerCap > 0 && engine.GeneratedPassengers > *passengerCap { engine.GeneratedPassengers = *passengerCap }
 			flush("done", map[string]any{"completed": true, "generated_passengers": engine.GeneratedPassengers, "outbound_generated": engine.OutboundGenerated, "inbound_generated": engine.InboundGenerated, "served_passengers": cumServed, "avg_wait_min": avgFinal})
 			// Optional CSV report
 			if *reportPath != "" {
