@@ -44,20 +44,25 @@ Frontend visualization
 
 ```
 brt08/
-	backend/           # Go HTTP server + simulator
-		data/            # Route JSON (kimara_kivukoni_stops.json)
-	frontend/          # Vite + TypeScript + Leaflet UI
+	backend/            # Go HTTP server + simulator
+		main.go          # Thin entrypoint (flags, load data, start server)
+		server/          # HTTP API + SSE streaming orchestration
+		sim/             # Simulator helpers (demand generation, utils)
+		model/           # Data models & loaders
+		data/            # Route JSON (kimara_kivukoni_stops.json), fleet.json
+		tools/           # Dev utilities
+	frontend/           # Vite + TypeScript + Leaflet UI
 		public/          # Static assets (images, data fallback)
-	readme.md          # This file
+	readme.md           # This file
 ```
 
 ## Backend (Go)
 
-Run (port 8080 default):
+Run (SSE server on port 8080 by default):
 
 ```
 cd backend
-go run . -period 2 -passenger_cap 120 -dir_bias 1.6 -spatial_gradient 0.8 -baseline_demand 0.3 -time_scale 1.0 -arrival_factor 1.0 -report ./reports
+go run . -period 2 -passenger_cap 120 -dir_bias 1.6 -spatial_gradient 0.8 -baseline_demand 0.3 -time_scale 1.0 -arrival_factor 1.0 -report ./reports -addr :8080
 ```
 
 Flags:
@@ -70,6 +75,20 @@ Flags:
 - `-time_scale float` (>0) Real‑time acceleration (affects all waits). Range effectively clamped internally.
 - `-arrival_factor float` (>0) Initial global multiplier on passenger arrival rate (runtime adjustable).
 - `-report path|dir` If set, writes timestamped CSV.
+- `-addr host:port` Listen address for the HTTP server (default `:8080`).
+- `-driver string` Simulation driver: `sse` (default) for interactive streaming UI, or `batch` for headless, fast simulation without SSE.
+
+Batch driver (headless, faster):
+
+```
+cd backend
+go run . -driver batch -period 2 -passenger_cap 100 -dir_bias 1.6 -spatial_gradient 0.8 -baseline_demand 0.3 -report ./reports
+```
+
+Notes (batch):
+- Requires `-passenger_cap > 0` and generates all passengers up front for speed.
+- Runs without SSE and without real-time sleeps; prints a summary and optional CSV.
+- Uses the same demand configuration as SSE (direction bias, spatial gradient, baseline).
 
 Passenger generation notes:
 - Initial 5% seed ensures early boarding action then per‑second Poisson batches.
@@ -78,6 +97,13 @@ Passenger generation notes:
 Notes:
 - Passenger generation is gradual: a small initial seed (~5%) is added, then passengers arrive at random intervals (200–800ms) until the `-passenger_cap` target is reached (or forever if 0).
 - Each SSE connection creates independent per-connection bus state and generator.
+- Exact passenger cap adherence: generation respects `-passenger_cap` precisely (no overshoot), including seeded + streamed passengers.
+
+### Backend architecture
+
+- `server` package hosts the HTTP API and encapsulates all SSE streaming and simulation orchestration.
+- `sim` package contains demand helpers and small simulator utilities used by the server.
+- `main.go` is intentionally thin: it parses flags, loads data, builds the fleet, constructs `server.Options`, calls `server.New(...).Serve()`, and then starts `http.ListenAndServe`.
 
 ### Endpoints
 

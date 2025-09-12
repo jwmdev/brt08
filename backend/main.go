@@ -1,14 +1,15 @@
 package main
 
 import (
+	"brt08/backend/driver"
+	"brt08/backend/model"
+	"brt08/backend/server"
 	"flag"
 	"log"
 	"math/rand"
 	"net/http"
 	"os"
 	"time"
-	"brt08/backend/model"
-	"brt08/backend/server"
 )
 
 func main() {
@@ -23,20 +24,59 @@ func main() {
 	defaultSpeed := flag.Float64("time_scale", 1.0, "simulation real-time speed multiplier (>1 = faster)")
 	defaultArrFactor := flag.Float64("arrival_factor", 1.0, "multiplier for passenger arrival rate (>1 = faster)")
 	addr := flag.String("addr", ":8080", "listen address")
+	driverMode := flag.String("driver", "sse", "simulation driver: sse | batch")
+	seed := flag.Int64("seed", 0, "random seed for reproducible runs (0 = random)")
+	traceBus := flag.Int("trace_bus", 0, "if >0, emit detailed trace logs for this bus id in chosen driver")
 	flag.Parse()
 
 	// Load route
-	rf, err := os.Open("data/kimara_kivukoni_stops.json"); if err != nil { panic(err) }
+	rf, err := os.Open("data/kimara_kivukoni_stops.json")
+	if err != nil {
+		panic(err)
+	}
 	defer rf.Close()
-	route, err := model.LoadRouteFromReader(rf, 100); if err != nil { panic(err) }
+	route, err := model.LoadRouteFromReader(rf, 100)
+	if err != nil {
+		panic(err)
+	}
 
 	// Load fleet or fallback
-	fleetFile, err := os.Open("data/fleet.json"); if err != nil { log.Printf("warning: open fleet.json failed: %v; falling back to two default buses", err) }
+	fleetFile, err := os.Open("data/fleet.json")
+	if err != nil {
+		log.Printf("warning: open fleet.json failed: %v; falling back to two default buses", err)
+	}
 	var fleetBuses []*model.Bus
-	if err == nil { defer fleetFile.Close(); types, qty, ferr := model.LoadFleetFromReader(fleetFile); if ferr != nil { log.Printf("warning: parse fleet.json failed: %v; using defaults", ferr) } else { rng := rand.New(rand.NewSource(time.Now().UnixNano())); first := route.Stops[0].ID; last := route.Stops[len(route.Stops)-1].ID; fleetBuses = model.BuildFleetBuses(types, qty, route.ID, first, last, rng) } }
-	if len(fleetBuses) == 0 { bt := &model.BusType{ID:1, Name:"Standard 12m", Capacity:70, CostPerKm:1.75}; fleetBuses = []*model.Bus{{ID:1, Type:bt, RouteID: route.ID, CurrentStopID: route.Stops[0].ID, Direction:"outbound", AverageSpeedKmph:28.0}, {ID:2, Type:bt, RouteID: route.ID, CurrentStopID: route.Stops[len(route.Stops)-1].ID, Direction:"inbound", AverageSpeedKmph:28.0}} }
+	if err == nil {
+		defer fleetFile.Close()
+		types, qty, ferr := model.LoadFleetFromReader(fleetFile)
+		if ferr != nil {
+			log.Printf("warning: parse fleet.json failed: %v; using defaults", ferr)
+		} else {
+			baseSeed := *seed
+			if baseSeed == 0 {
+				baseSeed = time.Now().UnixNano()
+			}
+			rng := rand.New(rand.NewSource(baseSeed))
+			first := route.Stops[0].ID
+			last := route.Stops[len(route.Stops)-1].ID
+			fleetBuses = model.BuildFleetBuses(types, qty, route.ID, first, last, rng)
+		}
+	}
+	if len(fleetBuses) == 0 {
+		bt := &model.BusType{ID: 1, Name: "Standard 12m", Capacity: 70, CostPerKm: 1.75}
+		fleetBuses = []*model.Bus{{ID: 1, Type: bt, RouteID: route.ID, CurrentStopID: route.Stops[0].ID, Direction: "outbound", AverageSpeedKmph: 28.0}, {ID: 2, Type: bt, RouteID: route.ID, CurrentStopID: route.Stops[len(route.Stops)-1].ID, Direction: "inbound", AverageSpeedKmph: 28.0}}
+	}
 
-	srv := server.New(route, fleetBuses, server.Options{PeriodID:*periodID, PassengerCap:*passengerCap, MorningTowardKivukoni:*morningTowardKivukoni, DirBias:*dirBias, SpatialGradient:*spatialGradient, BaselineDemand:*baselineDemand, DefaultSpeed:*defaultSpeed, DefaultArrivalFactor:*defaultArrFactor, ReportPath:*reportPath})
+	if *driverMode == "batch" {
+		// Run headless, fast simulation without SSE
+		_, err := driver.Run(route, fleetBuses, driver.Options{PeriodID: *periodID, PassengerCap: *passengerCap, MorningTowardKivukoni: *morningTowardKivukoni, DirBias: *dirBias, SpatialGradient: *spatialGradient, BaselineDemand: *baselineDemand, ArrivalFactor: *defaultArrFactor, ReportPath: *reportPath, Seed: *seed, TraceBusID: *traceBus})
+		if err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+	// Default: SSE server
+	srv := server.New(route, fleetBuses, server.Options{PeriodID: *periodID, PassengerCap: *passengerCap, MorningTowardKivukoni: *morningTowardKivukoni, DirBias: *dirBias, SpatialGradient: *spatialGradient, BaselineDemand: *baselineDemand, DefaultSpeed: *defaultSpeed, DefaultArrivalFactor: *defaultArrFactor, ReportPath: *reportPath, Seed: *seed, TraceBusID: *traceBus})
 	srv.Serve()
 	log.Printf("Serving on %s", *addr)
 	log.Fatal(http.ListenAndServe(*addr, nil))
