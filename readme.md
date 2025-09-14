@@ -211,5 +211,5 @@ This project is a sandbox for exploring BRT operations, demand patterns, control
 
 ## Timetable
 
-[ ] Topic 1 - Data type - By 17 September, 2025
-[ ] Topic 2 - For loops - By 23 September, 2025
+- [ ] Topic 1 - Data type - By 17 September, 2025
+- [ ] Topic 2 - For loops - By 23 September, 2025
