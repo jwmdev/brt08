@@ -206,3 +206,10 @@ curl -X POST http://localhost:8080/api/control -H 'Content-Type: application/jso
 
 This project is a sandbox for exploring BRT operations, demand patterns, control strategies and visualization. Contributions & ideas welcome.
 
+
+
+
+## Timetable
+
+- Topic 1 - Data type - By 17 September, 2025
+- Topic 2 - For loops - By 23 September, 2025

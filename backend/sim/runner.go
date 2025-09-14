@@ -26,9 +26,6 @@ func (s StaticControl) Speed() float64 {
 	if s.SpeedMult <= 0 {
 		return 1
 	}
-	if s.SpeedMult > 10 {
-		return 10
-	}
 	return s.SpeedMult
 }
 func (s StaticControl) ArrivalFactor() float64 {
@@ -53,6 +50,8 @@ func StartRunner(route *model.Route, fleet []*model.Bus, engineSeed int64, lambd
 	TraceBusID            int
 	ConnID                string
 	Start                 time.Time
+	RealTimeFactor        float64       // sim seconds to real seconds scaling (default 0.2)
+	MinSleep              time.Duration // minimum real sleep per wait; if 0, may skip sleep
 }, ctrl Control) (events <-chan Event, stop func(), wait func()) {
 	ch := make(chan Event, 256)
 	var wg sync.WaitGroup
@@ -89,7 +88,14 @@ func StartRunner(route *model.Route, fleet []*model.Bus, engineSeed int64, lambd
 	busDistance := make(map[int]float64)
 
 	// simulate time speed mapping (simulation seconds to real seconds)
-	const simSecToReal = 0.2
+	simSecToReal := 0.2
+	if opts.RealTimeFactor > 0 {
+		simSecToReal = opts.RealTimeFactor
+	}
+	minSleep := 1 * time.Millisecond
+	if opts.MinSleep > 0 {
+		minSleep = opts.MinSleep
+	}
 	waitSim := func(simDur time.Duration) bool {
 		remaining := simDur
 		for remaining > 0 {
@@ -103,10 +109,19 @@ func StartRunner(route *model.Route, fleet []*model.Bus, engineSeed int64, lambd
 				cur = 1
 			}
 			realSleep := time.Duration(float64(chunk) * simSecToReal / cur)
-			select {
-			case <-stopCh:
-				return false
-			case <-time.After(realSleep):
+			if realSleep <= minSleep {
+				// Skip or minimize sleeping when threshold is tiny (fast batch mode)
+				select {
+				case <-stopCh:
+					return false
+				default:
+				}
+			} else {
+				select {
+				case <-stopCh:
+					return false
+				case <-time.After(realSleep):
+				}
 			}
 			remaining -= chunk
 		}
@@ -170,16 +185,18 @@ func StartRunner(route *model.Route, fleet []*model.Bus, engineSeed int64, lambd
 	// Emit init event
 	ch <- InitEvent{Time: engine.Now, ConnID: opts.ConnID, Generated: engine.GeneratedPassengers, OutboundGen: engine.OutboundGenerated, InboundGen: engine.InboundGenerated, AvgWaitMin: 0.0, ArrivalFactor: ctrl.ArrivalFactor()}
 
-	// Start generator goroutine if needed
+	// Deterministic on-demand generator state
+	genNow := opts.Start
+
+	// Start generator goroutine if needed (disabled when MinSleep==0 for deterministic batch mode)
 	var genWg sync.WaitGroup
 	genStarted := false
-	if totalTarget == 0 || engine.GeneratedPassengers < totalTarget {
+	if (totalTarget == 0 || engine.GeneratedPassengers < totalTarget) && opts.MinSleep > 0 {
 		genStarted = true
 		genWg.Add(1)
 		go func() {
 			defer genWg.Done()
 			simStep := 1 * time.Second
-			genNow := opts.Start
 			for {
 				if totalTarget > 0 && engine.GeneratedPassengers >= totalTarget {
 					return
@@ -218,6 +235,48 @@ func StartRunner(route *model.Route, fleet []*model.Bus, engineSeed int64, lambd
 				mu.Unlock()
 			}
 		}()
+	}
+
+	// On-demand generation used when background generator is disabled
+	advanceGenTo := func(target time.Time) {
+		if opts.MinSleep > 0 {
+			return // background generator active
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if totalTarget > 0 && engine.GeneratedPassengers >= totalTarget {
+			genNow = target
+			return
+		}
+		for genNow.Before(target) {
+			// step by 1s to mirror background generator semantics
+			step := genNow.Add(1 * time.Second)
+			if step.After(target) {
+				step = target
+			}
+			stepMin := step.Sub(genNow).Minutes()
+			arrMult := ctrl.ArrivalFactor()
+			mean := lambda * float64(mult) * stepMin * arrMult
+			count := engine.PoissonPublic(mean)
+			if totalTarget > 0 {
+				remaining := totalTarget - engine.GeneratedPassengers
+				if remaining < 0 {
+					remaining = 0
+				}
+				if count > remaining {
+					count = remaining
+				}
+			}
+			if count > 0 {
+				updated := GenerateBatch(engine, route, count, step, totalTarget, cfg)
+				// stop updates are not strictly required for batch determinism; skip emitting to reduce noise
+				_ = updated
+			}
+			genNow = step
+			if totalTarget > 0 && engine.GeneratedPassengers >= totalTarget {
+				break
+			}
+		}
 	}
 
 	// choose initial directions based on period bias
@@ -385,6 +444,8 @@ func StartRunner(route *model.Route, fleet []*model.Bus, engineSeed int64, lambd
 						mu.Lock()
 						engine.Now = engine.Now.Add(650 * time.Millisecond)
 						mu.Unlock()
+						// Ensure passengers up to current time are generated deterministically in fast batch mode
+						advanceGenTo(engine.Now)
 						mu.Lock()
 						boarded := stop.BoardAtStop(bu, engine.Now)
 						if len(boarded) > 0 {
@@ -416,6 +477,7 @@ func StartRunner(route *model.Route, fleet []*model.Bus, engineSeed int64, lambd
 						mu.Lock()
 						engine.Now = engine.Now.Add(dwell)
 						mu.Unlock()
+						advanceGenTo(engine.Now)
 						if isDone() {
 							return
 						}
@@ -442,6 +504,7 @@ func StartRunner(route *model.Route, fleet []*model.Bus, engineSeed int64, lambd
 							mu.Lock()
 							engine.Now = engine.Now.Add(stepSim)
 							mu.Unlock()
+							advanceGenTo(engine.Now)
 							select {
 							case <-stopCh:
 								return
@@ -469,6 +532,7 @@ func StartRunner(route *model.Route, fleet []*model.Bus, engineSeed int64, lambd
 					mu.Lock()
 					engine.Now = engine.Now.Add(3 * time.Second)
 					mu.Unlock()
+					advanceGenTo(engine.Now)
 					signalStopIfDone()
 					bu.Direction = "inbound"
 					dirForward = false
@@ -508,6 +572,7 @@ func StartRunner(route *model.Route, fleet []*model.Bus, engineSeed int64, lambd
 						mu.Lock()
 						engine.Now = engine.Now.Add(650 * time.Millisecond)
 						mu.Unlock()
+						advanceGenTo(engine.Now)
 						mu.Lock()
 						boarded := stop.BoardAtStop(bu, engine.Now)
 						if len(boarded) > 0 {
@@ -539,6 +604,7 @@ func StartRunner(route *model.Route, fleet []*model.Bus, engineSeed int64, lambd
 						mu.Lock()
 						engine.Now = engine.Now.Add(dwell)
 						mu.Unlock()
+						advanceGenTo(engine.Now)
 						if isDone() {
 							return
 						}
@@ -565,6 +631,7 @@ func StartRunner(route *model.Route, fleet []*model.Bus, engineSeed int64, lambd
 							mu.Lock()
 							engine.Now = engine.Now.Add(stepSim)
 							mu.Unlock()
+							advanceGenTo(engine.Now)
 							select {
 							case <-stopCh:
 								return
@@ -592,6 +659,7 @@ func StartRunner(route *model.Route, fleet []*model.Bus, engineSeed int64, lambd
 					mu.Lock()
 					engine.Now = engine.Now.Add(3 * time.Second)
 					mu.Unlock()
+					advanceGenTo(engine.Now)
 					signalStopIfDone()
 					bu.Direction = "outbound"
 					dirForward = true
@@ -725,6 +793,7 @@ func StartRunner(route *model.Route, fleet []*model.Bus, engineSeed int64, lambd
 							engine.Now = engine.Now.Add(stepSim)
 							busDistance[bus.ID] += dist / float64(steps)
 							mu.Unlock()
+							advanceGenTo(engine.Now)
 						}
 						bus.CurrentStopID = to.ID
 					}

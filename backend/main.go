@@ -69,7 +69,7 @@ func main() {
 
 	if *driverMode == "batch" {
 		// Run headless, fast simulation without SSE
-		_, err := driver.Run(route, fleetBuses, driver.Options{PeriodID: *periodID, PassengerCap: *passengerCap, MorningTowardKivukoni: *morningTowardKivukoni, DirBias: *dirBias, SpatialGradient: *spatialGradient, BaselineDemand: *baselineDemand, ArrivalFactor: *defaultArrFactor, ReportPath: *reportPath, Seed: *seed, TraceBusID: *traceBus})
+		_, err := driver.Run(route, fleetBuses, driver.Options{PeriodID: *periodID, PassengerCap: *passengerCap, MorningTowardKivukoni: *morningTowardKivukoni, DirBias: *dirBias, SpatialGradient: *spatialGradient, BaselineDemand: *baselineDemand, ArrivalFactor: *defaultArrFactor, TimeScale: *defaultSpeed, ReportPath: *reportPath, Seed: *seed, TraceBusID: *traceBus})
 		if err != nil {
 			log.Fatal(err)
 		}

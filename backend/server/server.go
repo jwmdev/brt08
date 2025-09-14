@@ -234,7 +234,9 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			TraceBusID            int
 			ConnID                string
 			Start                 time.Time
-		}{PeriodID: s.Opt.PeriodID, PassengerCap: s.Opt.PassengerCap, MorningTowardKivukoni: s.Opt.MorningTowardKivukoni, DirBias: s.Opt.DirBias, SpatialGradient: s.Opt.SpatialGradient, BaselineDemand: s.Opt.BaselineDemand, TraceBusID: s.Opt.TraceBusID, ConnID: connID, Start: start}, ctrlAdapter{c: ctrl})
+			RealTimeFactor        float64
+			MinSleep              time.Duration
+		}{PeriodID: s.Opt.PeriodID, PassengerCap: s.Opt.PassengerCap, MorningTowardKivukoni: s.Opt.MorningTowardKivukoni, DirBias: s.Opt.DirBias, SpatialGradient: s.Opt.SpatialGradient, BaselineDemand: s.Opt.BaselineDemand, TraceBusID: s.Opt.TraceBusID, ConnID: connID, Start: start, RealTimeFactor: 0.2, MinSleep: 1 * time.Millisecond}, ctrlAdapter{c: ctrl})
 
 		// Ensure cleanup if client disconnects early
 		defer stopFn()
